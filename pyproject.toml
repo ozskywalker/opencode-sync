@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "opencode-sync"
 version = "0.1.0"
 description = "Sync opencode config with models served by a vLLM/llama.cpp server"
+readme = "README.md"
 requires-python = ">=3.8"
 dependencies = []
 
