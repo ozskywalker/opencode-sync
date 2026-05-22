@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opencode-sync"
+version = "0.1.0"
+description = "Sync opencode config with models served by a vLLM/llama.cpp server"
+requires-python = ">=3.8"
+dependencies = []
+
+[project.scripts]
+opencode-sync = "opencode_sync.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--tb=short"
+
+[tool.coverage.run]
+source = ["opencode_sync"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
