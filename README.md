@@ -18,7 +18,7 @@ pip install opencode-sync
 Or from source:
 
 ```bash
-git clone https://github.com/<you>/opencode-sync
+git clone https://github.com/ozskywalker/opencode-sync
 cd opencode-sync
 pip install -e .
 ```
