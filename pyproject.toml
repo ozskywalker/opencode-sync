@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=61", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "opencode-sync"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Sync opencode config with models served by a vLLM/llama.cpp server"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -18,6 +18,8 @@ dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
 ]
+
+[tool.setuptools_scm]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
