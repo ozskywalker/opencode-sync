@@ -232,6 +232,60 @@ class TestUsesExistingUrl:
 
 
 # ---------------------------------------------------------------------------
+# Environment target fallback
+# ---------------------------------------------------------------------------
+
+class TestEnvTarget:
+    def test_env_host_port_used_when_no_cli_target(self, tmp_path, mock_server, monkeypatch):
+        cfg = tmp_path / "opencode.jsonc"
+        write_sample_config(cfg)
+
+        srv = mock_server(["org/env-model"])
+        monkeypatch.setenv("LLAMA_ARG_HOST", "127.0.0.1")
+        monkeypatch.setenv("LLAMA_ARG_PORT", str(srv.port))
+
+        rc = main(["--config", str(cfg)])
+        assert rc == 0
+
+        updated = load_config(cfg)
+        assert "org/env-model" in updated["provider"]["vllm"]["models"]
+        assert (
+            updated["provider"]["vllm"]["options"]["baseURL"]
+            == f"http://127.0.0.1:{srv.port}/v1"
+        )
+
+    def test_cli_target_overrides_env_target(self, tmp_path, mock_server, monkeypatch):
+        cfg = tmp_path / "opencode.jsonc"
+        write_sample_config(cfg)
+
+        srv = mock_server(["org/cli-model"])
+        monkeypatch.setenv("LLAMA_ARG_HOST", "127.0.0.1")
+        monkeypatch.setenv("LLAMA_ARG_PORT", "1")
+
+        rc = main([
+            "--config", str(cfg),
+            "--host", "127.0.0.1", "--port", str(srv.port),
+        ])
+        assert rc == 0
+
+        updated = load_config(cfg)
+        assert "org/cli-model" in updated["provider"]["vllm"]["models"]
+        assert (
+            updated["provider"]["vllm"]["options"]["baseURL"]
+            == f"http://127.0.0.1:{srv.port}/v1"
+        )
+
+    def test_invalid_env_port_exits_nonzero(self, tmp_path, monkeypatch):
+        cfg = tmp_path / "opencode.jsonc"
+        write_sample_config(cfg)
+        monkeypatch.setenv("LLAMA_ARG_PORT", "not-a-port")
+
+        with pytest.raises(SystemExit) as exc_info:
+            main(["--config", str(cfg)])
+        assert exc_info.value.code != 0
+
+
+# ---------------------------------------------------------------------------
 # New config creation
 # ---------------------------------------------------------------------------
 

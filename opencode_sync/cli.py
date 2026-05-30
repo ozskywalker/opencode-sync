@@ -19,6 +19,8 @@ from .config import (
 from .vllm_client import DEFAULT_BASE_URL, VLLMClient, VLLMClientError
 
 DEFAULT_PORT = 8080
+LLAMA_HOST_ENV = "LLAMA_ARG_HOST"
+LLAMA_PORT_ENV = "LLAMA_ARG_PORT"
 
 _WRAPPER_TEMPLATE = """\
 #!/bin/sh
@@ -50,10 +52,12 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="opencode-sync",
         description=(
             "Sync opencode config with models served by a vLLM/llama.cpp server.\n\n"
-            "Default (no --host/--port): reads baseURL from the existing config and\n"
-            "queries that server without changing the URL in the config.\n\n"
-            "With --host or --port: queries the specified target and also updates\n"
-            "the provider's baseURL in the config (use --no-url-update to suppress)."
+            "Default (no --host/--port/LLAMA_ARG_HOST/LLAMA_ARG_PORT): reads\n"
+            "baseURL from the existing config and queries that server without\n"
+            "changing the URL in the config.\n\n"
+            "With CLI or llama.cpp env host/port: queries the specified target\n"
+            "and updates the provider's baseURL in the config "
+            "(use --no-url-update to suppress)."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -202,6 +206,21 @@ def _cmd_install(args) -> int:
     return 0
 
 
+def _env_value(name: str) -> Optional[str]:
+    value = os.environ.get(name)
+    return value if value else None
+
+
+def _env_port() -> Optional[int]:
+    value = _env_value(LLAMA_PORT_ENV)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        _die(f"{LLAMA_PORT_ENV} must be an integer, got {value!r}.")
+
+
 def _resolve_config_path(explicit: Optional[Path]) -> Path:
     if explicit is not None:
         return explicit
@@ -224,7 +243,20 @@ def main(argv=None) -> int:
         return _cmd_install(args)
 
     config_path = _resolve_config_path(args.config)
-    user_specified_target = args.host is not None or args.port is not None
+    env_host = _env_value(LLAMA_HOST_ENV)
+    env_port = _env_port()
+    target_specified = (
+        args.host is not None
+        or args.port is not None
+        or env_host is not None
+        or env_port is not None
+    )
+    target_host = args.host or env_host or "localhost"
+    target_port = (
+        args.port
+        if args.port is not None
+        else (env_port if env_port is not None else DEFAULT_PORT)
+    )
 
     # ------------------------------------------------------------------ #
     # Load existing config (or start fresh)
@@ -253,10 +285,8 @@ def main(argv=None) -> int:
             provider_id = "vllm"
         else:
             # Try to match by URL when we already know the target
-            if user_specified_target:
-                host = args.host or "localhost"
-                port = args.port or DEFAULT_PORT
-                candidate_url = f"http://{host}:{port}/v1"
+            if target_specified:
+                candidate_url = f"http://{target_host}:{target_port}/v1"
                 provider_id = find_provider_by_url(config, candidate_url)
             if provider_id is None:
                 _die(
@@ -274,10 +304,8 @@ def main(argv=None) -> int:
         .get("baseURL", "")
     )
 
-    if user_specified_target:
-        host = args.host or "localhost"
-        port = args.port or DEFAULT_PORT
-        query_base_url = f"http://{host}:{port}/v1"
+    if target_specified:
+        query_base_url = f"http://{target_host}:{target_port}/v1"
         new_config_base_url = None if args.no_url_update else query_base_url
     else:
         query_base_url = existing_base_url or DEFAULT_BASE_URL

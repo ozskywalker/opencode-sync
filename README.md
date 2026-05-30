@@ -75,8 +75,12 @@ The `model`/`small_model` fields are always written in opencode's expected `prov
 | Invocation | Server queried | `baseURL` in config |
 |---|---|---|
 | `opencode-sync` | Existing `baseURL` (fallback: `localhost:8080`) | **Unchanged** |
+| `LLAMA_ARG_HOST=X opencode-sync` | `http://X:8080/v1` | Updated |
+| `LLAMA_ARG_HOST=X LLAMA_ARG_PORT=9000 opencode-sync` | `http://X:9000/v1` | Updated |
 | `opencode-sync --host X` | `http://X:8080/v1` | Updated |
 | `opencode-sync --host X --no-url-update` | `http://X:8080/v1` | **Unchanged** |
+
+CLI `--host`/`--port` values override `LLAMA_ARG_HOST`/`LLAMA_ARG_PORT`.
 
 ### Display names are preserved
 
@@ -97,8 +101,8 @@ opencode-sync [--host HOST] [--port PORT] [--provider ID] [--config PATH]
 
 | Flag | Default | Description |
 |---|---|---|
-| `--host HOST` | from config | vLLM server hostname |
-| `--port PORT` | from config | vLLM server port |
+| `--host HOST` | env, config, else localhost | vLLM server hostname |
+| `--port PORT` | env, config, else 8080 | vLLM server port |
 | `--provider ID` | auto-detect | Provider key to update (required only with multiple providers) |
 | `--config PATH` | auto-detect | Path to `opencode.jsonc` |
 | `--dry-run` | off | Show changes without writing |
