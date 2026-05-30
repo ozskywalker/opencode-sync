@@ -104,7 +104,7 @@ SAMPLE_JSONC = """\
       "name": "vLLM (local)",
       "options": {
         // The endpoint URL
-        "baseURL": "http://localhost:8000/v1"
+        "baseURL": "http://localhost:8080/v1"
       },
       "models": {
         // MUST match the --model argument
@@ -128,7 +128,7 @@ SAMPLE_CONFIG = {
         "vllm": {
             "npm": "@ai-sdk/openai-compatible",
             "name": "vLLM (local)",
-            "options": {"baseURL": "http://localhost:8000/v1"},
+            "options": {"baseURL": "http://localhost:8080/v1"},
             "models": {
                 "org/model-a": {"name": "Model A"},
                 "org/model-b": {"name": "Model B"},

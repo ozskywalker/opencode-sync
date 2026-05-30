@@ -8,6 +8,8 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
+DEFAULT_BASE_URL = "http://localhost:8080/v1"
+
 
 @dataclass
 class ModelInfo:
@@ -58,7 +60,7 @@ class VLLMClient:
 
     def __init__(
         self,
-        base_url: str = "http://localhost:8000/v1",
+        base_url: str = DEFAULT_BASE_URL,
         timeout: int = 10,
         _http_get: Optional[Callable[[str, int], dict]] = None,
     ):

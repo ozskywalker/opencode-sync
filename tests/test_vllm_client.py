@@ -16,7 +16,7 @@ from opencode_sync.vllm_client import (
 # Helpers
 # ---------------------------------------------------------------------------
 
-def make_client(response=None, error=None, base_url="http://localhost:8000/v1"):
+def make_client(response=None, error=None, base_url="http://localhost:8080/v1"):
     """Build a VLLMClient with an injected _http_get stub."""
 
     def _get(url: str, timeout: int) -> dict:

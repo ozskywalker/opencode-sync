@@ -126,7 +126,7 @@ class TestParseJsonc:
 
     def test_real_world_sample(self):
         result = parse_jsonc(SAMPLE_JSONC)
-        assert result["provider"]["vllm"]["options"]["baseURL"] == "http://localhost:8000/v1"
+        assert result["provider"]["vllm"]["options"]["baseURL"] == "http://localhost:8080/v1"
         assert "org/model-a" in result["provider"]["vllm"]["models"]
 
     def test_invalid_json_raises(self):
@@ -257,18 +257,18 @@ class TestFindProviderByUrl:
     def test_finds_matching_provider(self):
         config = {
             "provider": {
-                "vllm": {"options": {"baseURL": "http://localhost:8000/v1"}},
+                "vllm": {"options": {"baseURL": "http://localhost:8080/v1"}},
             }
         }
-        assert find_provider_by_url(config, "http://localhost:8000/v1") == "vllm"
+        assert find_provider_by_url(config, "http://localhost:8080/v1") == "vllm"
 
     def test_trailing_slash_ignored(self):
         config = {
             "provider": {
-                "vllm": {"options": {"baseURL": "http://localhost:8000/v1/"}},
+                "vllm": {"options": {"baseURL": "http://localhost:8080/v1/"}},
             }
         }
-        assert find_provider_by_url(config, "http://localhost:8000/v1") == "vllm"
+        assert find_provider_by_url(config, "http://localhost:8080/v1") == "vllm"
 
     def test_no_match_returns_none(self):
         config = {
@@ -276,14 +276,14 @@ class TestFindProviderByUrl:
                 "vllm": {"options": {"baseURL": "http://other:9000/v1"}},
             }
         }
-        assert find_provider_by_url(config, "http://localhost:8000/v1") is None
+        assert find_provider_by_url(config, "http://localhost:8080/v1") is None
 
     def test_empty_config_returns_none(self):
-        assert find_provider_by_url({}, "http://localhost:8000/v1") is None
+        assert find_provider_by_url({}, "http://localhost:8080/v1") is None
 
     def test_no_options_key_returns_none(self):
         config = {"provider": {"vllm": {}}}
-        assert find_provider_by_url(config, "http://localhost:8000/v1") is None
+        assert find_provider_by_url(config, "http://localhost:8080/v1") is None
 
 
 # ---------------------------------------------------------------------------
@@ -347,7 +347,7 @@ class TestUpdateProviderModels:
         updated, _, _ = update_provider_models(
             self._base(), "vllm", ["org/model-a"], base_url=None
         )
-        assert updated["provider"]["vllm"]["options"]["baseURL"] == "http://localhost:8000/v1"
+        assert updated["provider"]["vllm"]["options"]["baseURL"] == "http://localhost:8080/v1"
 
     # -- active model handling
 

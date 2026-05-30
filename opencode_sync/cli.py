@@ -16,7 +16,9 @@ from .config import (
     save_config,
     update_provider_models,
 )
-from .vllm_client import VLLMClient, VLLMClientError
+from .vllm_client import DEFAULT_BASE_URL, VLLMClient, VLLMClientError
+
+DEFAULT_PORT = 8080
 
 _WRAPPER_TEMPLATE = """\
 #!/bin/sh
@@ -105,7 +107,7 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         metavar="PORT",
-        help="vLLM server port (default: read from config, else 8000)",
+        help=f"vLLM server port (default: read from config, else {DEFAULT_PORT})",
     )
     p.add_argument(
         "--provider",
@@ -253,7 +255,7 @@ def main(argv=None) -> int:
             # Try to match by URL when we already know the target
             if user_specified_target:
                 host = args.host or "localhost"
-                port = args.port or 8000
+                port = args.port or DEFAULT_PORT
                 candidate_url = f"http://{host}:{port}/v1"
                 provider_id = find_provider_by_url(config, candidate_url)
             if provider_id is None:
@@ -274,11 +276,11 @@ def main(argv=None) -> int:
 
     if user_specified_target:
         host = args.host or "localhost"
-        port = args.port or 8000
+        port = args.port or DEFAULT_PORT
         query_base_url = f"http://{host}:{port}/v1"
         new_config_base_url = None if args.no_url_update else query_base_url
     else:
-        query_base_url = existing_base_url or "http://localhost:8000/v1"
+        query_base_url = existing_base_url or DEFAULT_BASE_URL
         new_config_base_url = None  # Don't touch the stored URL
 
     # ------------------------------------------------------------------ #

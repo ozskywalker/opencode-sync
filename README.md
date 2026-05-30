@@ -34,7 +34,7 @@ opencode-sync
 **Point at a specific server and update the stored URL:**
 
 ```bash
-opencode-sync --host llm-server.local --port 8000
+opencode-sync --host llm-server.local --port 8080
 ```
 
 **Preview changes without writing anything:**
@@ -74,9 +74,9 @@ The `model`/`small_model` fields are always written in opencode's expected `prov
 
 | Invocation | Server queried | `baseURL` in config |
 |---|---|---|
-| `opencode-sync` | Existing `baseURL` (fallback: `localhost:8000`) | **Unchanged** |
-| `opencode-sync --host X` | `http://X:8000/v1` | Updated |
-| `opencode-sync --host X --no-url-update` | `http://X:8000/v1` | **Unchanged** |
+| `opencode-sync` | Existing `baseURL` (fallback: `localhost:8080`) | **Unchanged** |
+| `opencode-sync --host X` | `http://X:8080/v1` | Updated |
+| `opencode-sync --host X --no-url-update` | `http://X:8080/v1` | **Unchanged** |
 
 ### Display names are preserved
 
