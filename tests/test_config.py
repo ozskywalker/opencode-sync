@@ -158,36 +158,73 @@ class TestFindConfigPath:
         cfg = tmp_path / ".config" / "opencode" / "opencode.jsonc"
         cfg.parent.mkdir(parents=True)
         cfg.write_text("{}")
-        with patch("opencode_sync.config.platform.system", return_value="Linux"):
-            result = find_config_path()
+        result = find_config_path()
         assert result == cfg
 
     def test_returns_candidate_even_if_not_existing(self, tmp_path, monkeypatch):
         monkeypatch.setenv("XDG_CONFIG_HOME", "")
         monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
-        with patch("opencode_sync.config.platform.system", return_value="Linux"):
-            result = find_config_path()
+        result = find_config_path()
         # Should return *something*, not None
         assert result is not None
 
-    def test_windows_appdata_candidate(self, tmp_path):
-        cfg = tmp_path / "opencode" / "opencode.jsonc"
-        cfg.parent.mkdir(parents=True)
-        cfg.write_text("{}")
-        with patch("opencode_sync.config.platform.system", return_value="Windows"), \
-             patch.dict(os.environ, {"APPDATA": str(tmp_path), "XDG_CONFIG_HOME": ""}):
+    def test_windows_uses_home_config_not_appdata(self, tmp_path, monkeypatch):
+        # opencode uses xdg-basedir on Windows; APPDATA is NOT in the load order.
+        monkeypatch.setenv("XDG_CONFIG_HOME", "")
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+        appdata_cfg = tmp_path / "AppData" / "Roaming" / "opencode" / "opencode.jsonc"
+        appdata_cfg.parent.mkdir(parents=True)
+        appdata_cfg.write_text("{}")
+        home_cfg = tmp_path / ".config" / "opencode" / "opencode.jsonc"
+        home_cfg.parent.mkdir(parents=True)
+        home_cfg.write_text("{}")
+        with patch.dict(os.environ, {"APPDATA": str(tmp_path / "AppData" / "Roaming")}):
             result = find_config_path()
-        assert result == cfg
+        assert result == home_cfg
 
-    def test_macos_library_candidate(self, tmp_path, monkeypatch):
+    def test_windows_appdata_never_a_candidate(self, tmp_path, monkeypatch):
+        # Even if APPDATA path exists and ~/.config doesn't, APPDATA is not returned.
+        monkeypatch.setenv("XDG_CONFIG_HOME", "")
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+        appdata_cfg = tmp_path / "AppData" / "Roaming" / "opencode" / "opencode.jsonc"
+        appdata_cfg.parent.mkdir(parents=True)
+        appdata_cfg.write_text("{}")
+        with patch.dict(os.environ, {"APPDATA": str(tmp_path / "AppData" / "Roaming")}):
+            result = find_config_path()
+        # Should fall back to ~/.config default, not APPDATA
+        assert result == tmp_path / ".config" / "opencode" / "opencode.jsonc"
+
+    def test_macos_uses_home_config_not_library(self, tmp_path, monkeypatch):
+        # opencode uses xdg-basedir on macOS; Library/Application Support is NOT in the load order.
         monkeypatch.setenv("XDG_CONFIG_HOME", "")
         monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
         lib_cfg = tmp_path / "Library" / "Application Support" / "opencode" / "opencode.jsonc"
         lib_cfg.parent.mkdir(parents=True)
         lib_cfg.write_text("{}")
-        with patch("opencode_sync.config.platform.system", return_value="Darwin"):
+        home_cfg = tmp_path / ".config" / "opencode" / "opencode.jsonc"
+        home_cfg.parent.mkdir(parents=True)
+        home_cfg.write_text("{}")
+        result = find_config_path()
+        assert result == home_cfg
+
+    def test_macos_library_never_a_candidate(self, tmp_path, monkeypatch):
+        # Even if Library path exists and ~/.config doesn't, Library is not returned.
+        monkeypatch.setenv("XDG_CONFIG_HOME", "")
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+        lib_cfg = tmp_path / "Library" / "Application Support" / "opencode" / "opencode.jsonc"
+        lib_cfg.parent.mkdir(parents=True)
+        lib_cfg.write_text("{}")
+        result = find_config_path()
+        assert result == tmp_path / ".config" / "opencode" / "opencode.jsonc"
+
+    def test_fresh_windows_machine_fallback_is_home_config(self, tmp_path, monkeypatch):
+        # On a fresh Windows machine with no config, the creation target must be ~/.config.
+        monkeypatch.setenv("XDG_CONFIG_HOME", "")
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+        with patch.dict(os.environ, {"APPDATA": r"C:\Users\user\AppData\Roaming",
+                                     "LOCALAPPDATA": r"C:\Users\user\AppData\Local"}):
             result = find_config_path()
-        assert result == lib_cfg
+        assert result == tmp_path / ".config" / "opencode" / "opencode.jsonc"
 
 
 # ---------------------------------------------------------------------------

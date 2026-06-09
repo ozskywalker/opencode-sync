@@ -5,7 +5,6 @@ from __future__ import annotations
 import copy
 import json
 import os
-import platform
 import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -79,29 +78,19 @@ def parse_jsonc(text: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def _config_candidates() -> List[Path]:
-    """Return candidate config paths in priority order for the current platform."""
+    """Return candidate config paths in priority order for the current platform.
+
+    opencode uses xdg-basedir on all platforms, so the search order is the same
+    everywhere: XDG_CONFIG_HOME (if set) then ~/.config.  APPDATA and
+    ~/Library/Application Support are NOT part of the documented load order.
+    """
     candidates: List[Path] = []
-    system = platform.system()
 
-    if system == "Windows":
-        appdata = os.environ.get("APPDATA")
-        localappdata = os.environ.get("LOCALAPPDATA")
-        if appdata:
-            candidates.append(Path(appdata) / "opencode" / "opencode.jsonc")
-        if localappdata:
-            candidates.append(Path(localappdata) / "opencode" / "opencode.jsonc")
-
-    # XDG / standard Unix (Linux, macOS, and Windows fallback)
     xdg_config = os.environ.get("XDG_CONFIG_HOME")
     if xdg_config:
         candidates.append(Path(xdg_config) / "opencode" / "opencode.jsonc")
 
     candidates.append(Path.home() / ".config" / "opencode" / "opencode.jsonc")
-
-    if system == "Darwin":
-        candidates.append(
-            Path.home() / "Library" / "Application Support" / "opencode" / "opencode.jsonc"
-        )
 
     return candidates
 
