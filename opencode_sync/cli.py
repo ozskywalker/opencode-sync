@@ -3,19 +3,27 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import os
 import stat
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional
 
 from .config import (
+    ProviderPlan,
+    apply_plan,
+    apply_plans_to_text,
     find_config_path,
     find_provider_by_url,
     load_config,
+    load_config_text,
+    plan_provider_update,
     save_config,
-    update_provider_models,
+    save_config_text,
 )
+from .jsonc_edit import JsoncEditError
 from .vllm_client import DEFAULT_BASE_URL, VLLMClient, VLLMClientError
 
 DEFAULT_PORT = 8080
@@ -143,6 +151,24 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Don't update model/small_model even if the active model is removed",
     )
     p.add_argument(
+        "--rename",
+        action="append",
+        default=None,
+        metavar="OLD=NEW",
+        help=(
+            "Move an existing model entry to a new ID, keeping its settings and "
+            "comments (repeatable). Use when a server's model ID changes."
+        ),
+    )
+    p.add_argument(
+        "--no-infer-renames",
+        action="store_true",
+        help=(
+            "Don't treat a 1-removed/1-added sync as a rename; drop the old entry "
+            "and its settings instead"
+        ),
+    )
+    p.add_argument(
         "--timeout",
         type=int,
         default=10,
@@ -150,6 +176,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="HTTP request timeout in seconds (default: 10)",
     )
     return p
+
+
+def _parse_renames(values: Optional[List[str]]) -> Dict[str, str]:
+    renames: Dict[str, str] = {}
+    for item in values or []:
+        old, sep, new = item.partition("=")
+        if not sep or not old or not new:
+            _die(f"--rename expects OLD=NEW, got {item!r}.")
+        renames[old] = new
+    return renames
 
 
 def _cmd_install(args) -> int:
@@ -235,6 +271,130 @@ def _die(msg: str, code: int = 1) -> None:
     sys.exit(code)
 
 
+@dataclass
+class Target:
+    """One provider to sync, and the URL to query for it."""
+
+    provider_id: str
+    query_base_url: str
+    new_base_url: Optional[str]  # None means "leave the stored URL alone"
+
+
+def _resolve_targets(args, config: dict, target_specified: bool, host: str, port: int) -> List[Target]:
+    """Decide which providers to sync and which URL to ask each one about.
+
+    Explicit target (--provider, or --host/--port naming one server) keeps the old
+    single-provider semantics.  With neither, every provider that has a stored
+    baseURL is synced against its own URL — which is what makes the bare wrapper
+    invocation useful on a multi-provider config.
+    """
+    providers = config.get("provider", {})
+
+    def query_url_for(provider_id: str) -> str:
+        return providers.get(provider_id, {}).get("options", {}).get("baseURL", "")
+
+    if target_specified:
+        url = f"http://{host}:{port}/v1"
+        provider_id = args.provider_id
+        if provider_id is None:
+            if len(providers) == 1:
+                provider_id = next(iter(providers))
+            elif not providers:
+                provider_id = "vllm"
+            else:
+                provider_id = find_provider_by_url(config, url)
+                if provider_id is None:
+                    _die(
+                        f"Multiple providers found ({', '.join(providers)}). "
+                        "Use --provider to specify which one to update."
+                    )
+        return [Target(provider_id, url, None if args.no_url_update else url)]
+
+    if args.provider_id is not None:
+        url = query_url_for(args.provider_id) or DEFAULT_BASE_URL
+        return [Target(args.provider_id, url, None)]
+
+    if not providers:
+        return [Target("vllm", DEFAULT_BASE_URL, None)]
+
+    targets = []
+    for provider_id in providers:
+        url = query_url_for(provider_id)
+        if not url:
+            print(
+                f"WARNING: provider '{provider_id}' has no options.baseURL — skipping.",
+                file=sys.stderr,
+            )
+            continue
+        targets.append(Target(provider_id, url, None))
+
+    if not targets:
+        _die("No providers with a baseURL to sync. Use --host/--port or --provider.")
+    return targets
+
+
+def _sync_one(args, config: dict, target: Target, renames: Dict[str, str], single: bool):
+    """Query one server and plan its update.
+
+    Returns (plan, failed).  A plan of None means "nothing to do"; failed says
+    whether that was because the server was unreachable, which is the only case
+    that should colour the exit code.
+    """
+    print(f"Querying {target.query_base_url}/models for '{target.provider_id}' ...")
+    client = VLLMClient(base_url=target.query_base_url, timeout=args.timeout)
+    try:
+        model_ids = client.get_model_ids()
+    except VLLMClientError as e:
+        # A server we were explicitly pointed at is a hard error; one we merely
+        # discovered from the config is a warning, so one box being off doesn't
+        # block the others.
+        if single:
+            _die(str(e))
+        print(f"WARNING: {target.provider_id}: {e} — skipping.", file=sys.stderr)
+        return None, True
+
+    if not model_ids:
+        # The server is up, it just has nothing loaded. Never wipe the models list.
+        print(
+            f"WARNING: {target.provider_id}: server returned no models — skipping.",
+            file=sys.stderr,
+        )
+        return None, False
+
+    print(f"  Server reports {len(model_ids)} model(s): {', '.join(model_ids)}")
+
+    plan = plan_provider_update(
+        config=config,
+        provider_id=target.provider_id,
+        model_ids=model_ids,
+        base_url=target.new_base_url,
+        update_active_model=not args.no_model_update,
+        renames=renames,
+        infer_renames=not args.no_infer_renames,
+        normalize_bare_ids=single,
+    )
+    _report(plan, config)
+    return plan, False
+
+
+def _report(plan: ProviderPlan, config: dict) -> None:
+    existing = config.get("provider", {}).get(plan.provider_id, {}).get("models", {})
+    for old, new in plan.renames.items():
+        kept = sorted(set(existing.get(old, {})) - {"name"})
+        detail = f" (kept {', '.join(kept)})" if kept else ""
+        print(f"  ~ Renamed: {old} -> {new}{detail}")
+    if plan.added:
+        print(f"  + Added:   {', '.join(plan.added)}")
+    if plan.removed:
+        print(f"  - Removed: {', '.join(plan.removed)}")
+    if not (plan.added or plan.removed or plan.renames):
+        print("  Model list unchanged.")
+    if plan.base_url is not None:
+        print(f"  baseURL -> {plan.base_url!r}")
+    for key, value in plan.model_key_updates.items():
+        print(f"  {key}: {config.get(key)!r} -> {value!r}")
+
+
 def main(argv=None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -243,6 +403,7 @@ def main(argv=None) -> int:
         return _cmd_install(args)
 
     config_path = _resolve_config_path(args.config)
+    renames = _parse_renames(args.rename)
     env_host = _env_value(LLAMA_HOST_ENV)
     env_port = _env_port()
     target_specified = (
@@ -261,9 +422,11 @@ def main(argv=None) -> int:
     # ------------------------------------------------------------------ #
     # Load existing config (or start fresh)
     # ------------------------------------------------------------------ #
+    text: Optional[str] = None
     if config_path.exists():
         print(f"Loading config: {config_path}")
         try:
+            text = load_config_text(config_path)
             config = load_config(config_path)
         except Exception as e:
             _die(f"Failed to parse config: {e}")
@@ -271,100 +434,70 @@ def main(argv=None) -> int:
         print(f"Config not found — will create: {config_path}")
         config = {}
 
-    # ------------------------------------------------------------------ #
-    # Resolve provider ID
-    # ------------------------------------------------------------------ #
-    provider_id: Optional[str] = args.provider_id
+    targets = _resolve_targets(args, config, target_specified, target_host, target_port)
+    single = len(targets) == 1
 
-    if provider_id is None:
-        providers = config.get("provider", {})
-        if len(providers) == 1:
-            provider_id = next(iter(providers))
-        elif len(providers) == 0:
-            # New config — default to "vllm"
-            provider_id = "vllm"
-        else:
-            # Try to match by URL when we already know the target
-            if target_specified:
-                candidate_url = f"http://{target_host}:{target_port}/v1"
-                provider_id = find_provider_by_url(config, candidate_url)
-            if provider_id is None:
-                _die(
-                    f"Multiple providers found ({', '.join(providers)}). "
-                    "Use --provider to specify which one to update."
-                )
+    if renames and not single:
+        _die("--rename needs a single provider. Use --provider to pick one.")
 
     # ------------------------------------------------------------------ #
-    # Determine query URL and whether to update baseURL in config
+    # Query each server and plan its changes
     # ------------------------------------------------------------------ #
-    existing_base_url: str = (
-        config.get("provider", {})
-        .get(provider_id, {})
-        .get("options", {})
-        .get("baseURL", "")
-    )
+    plans = []
+    failures = 0
+    for target in targets:
+        plan, failed = _sync_one(args, config, target, renames, single)
+        failures += bool(failed)
+        if plan is not None:
+            plans.append(plan)
 
-    if target_specified:
-        query_base_url = f"http://{target_host}:{target_port}/v1"
-        new_config_base_url = None if args.no_url_update else query_base_url
-    else:
-        query_base_url = existing_base_url or DEFAULT_BASE_URL
-        new_config_base_url = None  # Don't touch the stored URL
+    if not plans:
+        if failures:
+            print("Nothing synced.", file=sys.stderr)
+            return 1
+        return 0  # servers were reachable, there was just nothing to apply
 
-    # ------------------------------------------------------------------ #
-    # Query the server
-    # ------------------------------------------------------------------ #
-    print(f"Querying {query_base_url}/models ...")
-    client = VLLMClient(base_url=query_base_url, timeout=args.timeout)
-    try:
-        model_ids = client.get_model_ids()
-    except VLLMClientError as e:
-        _die(str(e))
-
-    if not model_ids:
-        print("WARNING: Server returned no models. Config will not be updated.", file=sys.stderr)
+    if all(plan.is_noop() for plan in plans):
+        print("\nConfig already up to date.")
         return 0
 
-    print(f"Server reports {len(model_ids)} model(s): {', '.join(model_ids)}")
-
     # ------------------------------------------------------------------ #
-    # Compute and display changes
+    # Render the new config text
     # ------------------------------------------------------------------ #
-    print(f"Updating provider '{provider_id}'...")
-
-    updated_config, added, removed = update_provider_models(
-        config=config,
-        provider_id=provider_id,
-        model_ids=model_ids,
-        base_url=new_config_base_url,
-        update_active_model=not args.no_model_update,
-    )
-
-    if added:
-        print(f"  + Added:   {', '.join(added)}")
-    if removed:
-        print(f"  - Removed: {', '.join(removed)}")
-    if not added and not removed:
-        print("  Model list unchanged.")
-
-    if new_config_base_url and new_config_base_url != existing_base_url:
-        print(f"  baseURL: {existing_base_url!r} -> {new_config_base_url!r}")
-
-    for key in ("model", "small_model"):
-        old_val = config.get(key)
-        new_val = updated_config.get(key)
-        if old_val != new_val:
-            print(f"  {key}: {old_val!r} -> {new_val!r} (previous selection no longer served)")
+    if text is None:
+        updated = config
+        for plan in plans:
+            updated = apply_plan(updated, plan)
+        new_text = None  # greenfield: save_config renders it
+    else:
+        try:
+            new_text = apply_plans_to_text(text, config, plans)
+        except JsoncEditError as e:
+            _die(f"Refusing to write: {e}")
 
     # ------------------------------------------------------------------ #
     # Write (unless --dry-run)
     # ------------------------------------------------------------------ #
     if args.dry_run:
+        if new_text is not None:
+            diff = difflib.unified_diff(
+                text.splitlines(keepends=True),
+                new_text.splitlines(keepends=True),
+                fromfile=str(config_path),
+                tofile=f"{config_path} (planned)",
+            )
+            sys.stdout.writelines(diff)
         print("\n[dry-run] Config not written.")
         return 0
 
     try:
-        save_config(config_path, updated_config)
+        if new_text is None:
+            save_config(config_path, updated)
+        elif new_text == text:
+            print("\nConfig already byte-identical — not rewritten.")
+            return 0
+        else:
+            save_config_text(config_path, new_text, backup=True)
     except Exception as e:
         _die(f"Failed to write config: {e}")
 
