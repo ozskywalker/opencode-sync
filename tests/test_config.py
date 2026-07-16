@@ -12,7 +12,6 @@ import pytest
 
 from opencode_sync.config import (
     _strip_jsonc_comments,
-    _strip_trailing_commas,
     find_config_path,
     find_provider_by_url,
     generate_display_name,
@@ -86,22 +85,28 @@ class TestStripJsoncComments:
         _strip_jsonc_comments(text)
 
 
-class TestStripTrailingCommas:
+class TestTrailingCommas:
+    """Trailing-comma handling, exercised through the public parse_jsonc API.
+
+    The masker itself is covered in test_jsonc_edit.py.
+    """
+
     def test_trailing_comma_before_brace(self):
-        result = _strip_trailing_commas('{"a": 1,}')
-        assert result == '{"a": 1}'
+        assert parse_jsonc('{"a": 1,}') == {"a": 1}
 
     def test_trailing_comma_before_bracket(self):
-        result = _strip_trailing_commas("[1, 2, 3,]")
-        assert result == "[1, 2, 3]"
+        assert parse_jsonc('{"a": [1, 2, 3,]}') == {"a": [1, 2, 3]}
 
     def test_trailing_comma_with_whitespace(self):
-        result = _strip_trailing_commas('{"a": 1,  \n}')
-        assert result == '{"a": 1,  \n}'.replace(",  \n}", "  \n}")
+        assert parse_jsonc('{"a": 1,  \n}') == {"a": 1}
 
     def test_no_trailing_comma_unchanged(self):
-        text = '{"a": 1}'
-        assert _strip_trailing_commas(text) == text
+        assert parse_jsonc('{"a": 1}') == {"a": 1}
+
+    def test_comma_inside_a_string_value_survives(self):
+        # Regression: the old regex stripper was not string-aware and silently
+        # turned {"a": "x,  }"} into {"a": "x  }"}.
+        assert parse_jsonc('{"a": "x,  }"}') == {"a": "x,  }"}
 
 
 # ---------------------------------------------------------------------------

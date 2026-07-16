@@ -51,9 +51,15 @@ class _MockVLLMHandler(BaseHTTPRequestHandler):
 
 class MockVLLMServer:
     def __init__(self, models: List[str], fail_with: int = 0):
-        _MockVLLMHandler.models = models
-        _MockVLLMHandler.fail_with = fail_with
-        self._server = HTTPServer(("127.0.0.1", 0), _MockVLLMHandler)
+        # Per-server handler subclass: models/fail_with are class attributes, so
+        # sharing _MockVLLMHandler would let a second server clobber the first's
+        # model list.  Sync-all tests need two servers with different lists.
+        handler = type(
+            "_ScopedMockVLLMHandler",
+            (_MockVLLMHandler,),
+            {"models": list(models), "fail_with": fail_with},
+        )
+        self._server = HTTPServer(("127.0.0.1", 0), handler)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
 
