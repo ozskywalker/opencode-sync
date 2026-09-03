@@ -121,6 +121,186 @@ class TestFullSync:
 
 
 # ---------------------------------------------------------------------------
+# --default-model / --default-small-model / --prune-recent end to end
+# ---------------------------------------------------------------------------
+
+NO_POINTER_JSONC = """\
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "vllm": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "vLLM (local)",
+      "options": {
+        "baseURL": "http://localhost:8080/v1"
+      },
+      "models": {
+        "org/model-a": {
+          "name": "Model A",
+          "limit": { "context": 8192, "output": 4096 }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def write_no_pointer_config(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(NO_POINTER_JSONC, encoding="utf-8")
+
+
+class TestDefaultModelFlags:
+    def test_auto_mode_adds_pointer_on_model_change(self, tmp_path, mock_server):
+        cfg = tmp_path / "opencode.jsonc"
+        write_no_pointer_config(cfg)
+
+        # model-a is gone; server now serves model-b. No 'model' key existed.
+        srv = mock_server(["org/model-b"])
+        rc = main([
+            "--config", str(cfg),
+            "--host", "127.0.0.1", "--port", str(srv.port),
+            "--default-model", "auto",
+            "--default-small-model", "auto",
+        ])
+        assert rc == 0
+
+        updated = load_config(cfg)
+        assert updated["model"] == "vllm/org/model-b"
+        assert updated["small_model"] == "vllm/org/model-b"
+
+    def test_default_mode_does_not_add_pointer(self, tmp_path, mock_server):
+        cfg = tmp_path / "opencode.jsonc"
+        write_no_pointer_config(cfg)
+
+        srv = mock_server(["org/model-b"])
+        main(["--config", str(cfg), "--host", "127.0.0.1", "--port", str(srv.port)])
+
+        updated = load_config(cfg)
+        assert "model" not in updated  # legacy behavior preserved
+
+    def test_none_mode_keeps_stale_pointer_untouched(self, tmp_path, mock_server):
+        cfg = tmp_path / "opencode.jsonc"
+        write_sample_config(cfg)  # has model=vllm/org/model-a
+
+        srv = mock_server(["org/model-b"])
+        main([
+            "--config", str(cfg),
+            "--host", "127.0.0.1", "--port", str(srv.port),
+            "--default-model", "none",
+            "--default-small-model", "none",
+        ])
+
+        updated = load_config(cfg)
+        assert updated["model"] == "vllm/org/model-a"  # stale, but untouched
+
+    def test_explicit_pointer_written_and_preserved(self, tmp_path, mock_server):
+        cfg = tmp_path / "opencode.jsonc"
+        write_no_pointer_config(cfg)
+
+        srv = mock_server(["org/model-a"])
+        rc = main([
+            "--config", str(cfg),
+            "--host", "127.0.0.1", "--port", str(srv.port),
+            "--default-model", "vllm/org/model-a",
+            "--no-url-update",  # keep baseURL stable so run 2 is byte-identical
+        ])
+        assert rc == 0
+
+        updated = load_config(cfg)
+        assert updated["model"] == "vllm/org/model-a"
+
+        # Idempotent: second run must not rewrite (byte-identical shortcut).
+        text_after_first = cfg.read_text()
+        srv2 = mock_server(["org/model-a"])
+        rc2 = main([
+            "--config", str(cfg),
+            "--host", "127.0.0.1", "--port", str(srv2.port),
+            "--default-model", "vllm/org/model-a",
+            "--no-url-update",
+        ])
+        assert rc2 == 0
+        assert cfg.read_text() == text_after_first
+
+    def test_invalid_mode_dies(self, tmp_path, mock_server):
+        cfg = tmp_path / "opencode.jsonc"
+        write_no_pointer_config(cfg)
+
+        srv = mock_server(["org/model-a"])
+        with pytest.raises(SystemExit):
+            main([
+                "--config", str(cfg),
+                "--host", "127.0.0.1", "--port", str(srv.port),
+                "--default-model", "yolo",
+            ])
+
+    def test_auto_noop_sync_does_not_invent_pointer(self, tmp_path, mock_server):
+        cfg = tmp_path / "opencode.jsonc"
+        write_no_pointer_config(cfg)
+
+        # Model set unchanged → nothing happens, pointer NOT invented.
+        srv = mock_server(["org/model-a"])
+        rc = main([
+            "--config", str(cfg),
+            "--host", "127.0.0.1", "--port", str(srv.port),
+            "--default-model", "auto",
+        ])
+        assert rc == 0
+
+        updated = load_config(cfg)
+        assert "model" not in updated
+
+
+class TestPruneRecentFlag:
+    def test_prunes_stale_entries_after_sync(self, tmp_path, mock_server, monkeypatch):
+        cfg = tmp_path / "opencode.jsonc"
+        write_no_pointer_config(cfg)
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        state = tmp_path / "opencode" / "model.json"
+        state.parent.mkdir(parents=True, exist_ok=True)
+        state.write_text(json.dumps({
+            "recent": [
+                {"providerID": "vllm", "modelID": "org/dead"},
+                {"providerID": "vllm", "modelID": "org/model-a"},
+            ],
+            "favorite": [],
+        }), encoding="utf-8")
+
+        srv = mock_server(["org/model-a", "org/model-b"])  # org/dead is gone
+        rc = main([
+            "--config", str(cfg),
+            "--host", "127.0.0.1", "--port", str(srv.port),
+            "--prune-recent",
+        ])
+        assert rc == 0
+
+        data = json.loads(state.read_text(encoding="utf-8"))
+        assert [e["modelID"] for e in data["recent"]] == ["org/model-a"]
+
+    def test_prune_skipped_on_dry_run(self, tmp_path, mock_server, monkeypatch):
+        cfg = tmp_path / "opencode.jsonc"
+        write_no_pointer_config(cfg)
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        state = tmp_path / "opencode" / "model.json"
+        state.parent.mkdir(parents=True, exist_ok=True)
+        state.write_text(json.dumps({
+            "recent": [{"providerID": "vllm", "modelID": "org/dead"}],
+        }), encoding="utf-8")
+
+        srv = mock_server(["org/model-a"])
+        main([
+            "--config", str(cfg),
+            "--host", "127.0.0.1", "--port", str(srv.port),
+            "--prune-recent",
+            "--dry-run",
+        ])
+        # dry-run returns before writing; state file untouched
+        data = json.loads(state.read_text(encoding="utf-8"))
+        assert data["recent"] == [{"providerID": "vllm", "modelID": "org/dead"}]
+
+
+# ---------------------------------------------------------------------------
 # Dry run
 # ---------------------------------------------------------------------------
 

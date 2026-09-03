@@ -174,6 +174,11 @@ def find_provider_by_url(config: dict, base_url: str) -> Optional[str]:
     return None
 
 
+# Modes for how top-level model/small_model pointers are managed.  Exported so the
+# CLI can validate before touching disk.
+DEFAULT_MODEL_MODES = ("first", "none", "auto")
+
+
 @dataclass
 class ProviderPlan:
     """What a sync intends to do to one provider.  Computed before anything is written."""
@@ -189,6 +194,44 @@ class ProviderPlan:
     def is_noop(self) -> bool:
         return not (self.added or self.removed or self.renames or self.base_url
                     or self.model_key_updates)
+
+
+def _resolve_pointer_mode(
+    mode: str,
+    explicit: Optional[str],
+    provider_id: str,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Turn a --default-model style mode into (mode_for_planner, explicit_value).
+
+    An explicit ``provider/model`` value wins over any keyword mode.  A bare model
+    ID is rejected here rather than guessed at: only the user knows which provider
+    an unqualified ID belongs to when several are configured.
+    """
+    if explicit is not None or (mode not in DEFAULT_MODEL_MODES and "/" in mode):
+        # The CLI passes an explicit ID via the mode slot when only one flag form
+        # is used; accept either spelling.
+        value = explicit if explicit is not None else mode
+        if "/" not in value:
+            raise ValueError(
+                f"explicit default model {value!r} must be provider-qualified "
+                f"(provider/model-id)"
+            )
+        head = value.partition("/")[0]
+        if head != provider_id:
+            # Another provider's model: the caller plans that provider separately.
+            # Pointing at it from this plan would couple unrelated syncs.
+            raise ValueError(
+                f"explicit default model {value!r} names provider {head!r}, "
+                f"but this sync is for {provider_id!r}"
+            )
+        return "explicit", value
+
+    if mode not in DEFAULT_MODEL_MODES:
+        raise ValueError(
+            f"unknown default-model mode {mode!r}; expected one of "
+            f"{', '.join(DEFAULT_MODEL_MODES)} or an explicit provider/model ID"
+        )
+    return mode, None
 
 
 def _infer_renames(
@@ -224,13 +267,41 @@ def _plan_model_key_updates(
     model_ids: List[str],
     renames: Dict[str, str],
     normalize_bare_ids: bool,
+    model_mode: str = "first",
+    small_model_mode: str = "first",
+    explicit_model: Optional[str] = None,
+    explicit_small_model: Optional[str] = None,
+    model_set_changed: bool = False,
 ) -> Dict[str, str]:
     """Decide how top-level model/small_model should change, if at all.
 
-    The rule that matters: a pointer belonging to *another* provider is never
-    touched.  Model IDs may themselves contain slashes ("org/model-a"), so
+    Two orthogonal rules:
+
+    *Which pointers may we touch?*  A pointer belonging to *another* provider is
+    never touched.  Model IDs may themselves contain slashes ("org/model-a"), so
     "contains a slash" does not mean "provider-qualified" — the only reliable test
     is whether the first segment names a provider that actually exists.
+
+    *When do we touch them?*  The modes:
+      "first"  — legacy behavior.  Never invent a pointer; only repair one that
+                 already points at this provider and has gone stale (removed model,
+                 rename, or bare-ID normalization).  This is why a fresh sync of a
+                 renamed server does not make opencode default to the new model when
+                 no pointer existed.
+      "none"   — never touch the key at all, not even to repair it.
+      "auto"   — after a change to this provider's model set, point the key at the
+                 first served model, so opencode's own defaultModel() (which prefers
+                 config.model outright, then the recent[] state file, then the first
+                 config model) resolves to something this server actually serves.
+                 Only fires when the model set actually changed, so routine no-op
+                 syncs don't rewrite the pointer.
+      "explicit" — an explicit provider/model value was given; point the key there
+                 whenever it isn't already there (regardless of whether the sync
+                 changed anything else).
+
+    "auto"/"explicit" deliberately override the "never invent a pointer" rule: that
+    conservatism exists so a bare wrapper invocation can't surprise anyone, and the
+    user has now explicitly asked to be surprised.
     """
     known_providers = set(config.get("provider", {}))
     served = set(model_ids)
@@ -240,8 +311,60 @@ def _plan_model_key_updates(
 
     first_qualified = f"{provider_id}/{model_ids[0]}"
 
+    modes = {"model": model_mode, "small_model": small_model_mode}
+    explicit = {"model": explicit_model, "small_model": explicit_small_model}
+
     for key in ("model", "small_model"):
+        mode = modes[key]
         current = config.get(key)
+
+        if mode == "none":
+            continue
+
+        if mode == "explicit":
+            target = explicit[key]
+            if target is None:  # explicit value failed to resolve; treat as "first"
+                mode = "first"
+            elif current != target:
+                updates[key] = target
+                continue
+            else:
+                continue
+
+        if mode == "auto":
+            # Repair/repoint when this sync actually changed the provider's model
+            # set (the call site threads that via model_set_changed→renames signal
+            # and the explicit mode handles "always").  A pure no-op sync must not
+            # churn the pointer: the wrapper runs on every opencode launch.
+            if current is None:
+                # Invent a pointer only if the model set actually changed.
+                if not model_set_changed:
+                    continue
+                updates[key] = first_qualified
+                continue
+            head, sep, rest = current.partition("/")
+            owned_by_someone_else = sep and head in known_providers and head != provider_id
+            if owned_by_someone_else:
+                continue  # another provider's pointer — not ours to touch
+
+            if sep and head == provider_id:
+                target = renames.get(rest, rest)
+                if target not in served:
+                    updates[key] = first_qualified
+                elif target != rest:
+                    updates[key] = f"{provider_id}/{target}"
+                # else: pointer still valid and nothing to repair — leave it
+                continue
+
+            # Bare model ID, i.e. written by an older version of this tool.
+            if normalize_bare_ids and current in served:
+                updates[key] = f"{provider_id}/{current}"
+            elif model_set_changed:
+                # Stale bare ID (or unresolvable) and the set moved: repoint.
+                updates[key] = first_qualified
+            continue
+
+        # mode == "first": legacy repair-only behavior.
         if not current:
             continue  # never invent a pointer that wasn't there
 
@@ -274,30 +397,50 @@ def plan_provider_update(
     renames: Optional[Dict[str, str]] = None,
     infer_renames: bool = True,
     normalize_bare_ids: bool = True,
+    model_mode: str = "first",
+    small_model_mode: str = "first",
+    explicit_model: Optional[str] = None,
+    explicit_small_model: Optional[str] = None,
 ) -> ProviderPlan:
-    """Work out what syncing ``provider_id`` against ``model_ids`` would change."""
+    """Work out what syncing ``provider_id`` against ``model_ids`` would change.
+
+    ``model_mode``/``small_model_mode`` are "first", "none" or "auto";
+    ``explicit_model``/``explicit_small_model`` override them with a literal
+    "provider/model" pointer when given (validated against ``provider_id``).
+    """
     existing_models: Dict = (
         config.get("provider", {}).get(provider_id, {}).get("models", {}) or {}
     )
     existing_ids = set(existing_models)
     new_ids = set(model_ids)
 
-    explicit = {k: v for k, v in (renames or {}).items() if k in existing_ids}
+    explicit_renames = {k: v for k, v in (renames or {}).items() if k in existing_ids}
     added = sorted(new_ids - existing_ids)
     removed = sorted(existing_ids - new_ids)
 
     resolved = (
-        _infer_renames(existing_models, added, removed, explicit) if infer_renames else explicit
+        _infer_renames(existing_models, added, removed, explicit_renames) if infer_renames else explicit_renames
     )
     # A renamed model is a move, not an add plus a remove.
     added = [m for m in added if m not in resolved.values()]
     removed = [m for m in removed if m not in resolved]
 
-    model_key_updates = (
-        _plan_model_key_updates(config, provider_id, model_ids, resolved, normalize_bare_ids)
-        if update_active_model
-        else {}
-    )
+    model_set_changed = bool(added or removed or resolved)
+
+    model_key_updates = {}
+    if update_active_model:
+        model_mode_eff, explicit_model_eff = _resolve_pointer_mode(
+            model_mode, explicit_model, provider_id)
+        small_mode_eff, explicit_small_eff = _resolve_pointer_mode(
+            small_model_mode, explicit_small_model, provider_id)
+        model_key_updates = _plan_model_key_updates(
+            config, provider_id, model_ids, resolved, normalize_bare_ids,
+            model_mode=model_mode_eff,
+            small_model_mode=small_mode_eff,
+            explicit_model=explicit_model_eff,
+            explicit_small_model=explicit_small_eff,
+            model_set_changed=model_set_changed,
+        )
 
     existing_url = (
         config.get("provider", {}).get(provider_id, {}).get("options", {}).get("baseURL")
@@ -518,10 +661,15 @@ def _next_edit(text: str, masked: str, current: dict, desired: dict, plan: Provi
         if current.get(key) == value:
             continue
         member = _member_at(masked, [key])
-        if member is None:
-            # The planner only ever rewrites pointers that already exist.
-            raise JsoncEditError(f"cannot locate top-level {key!r}")
-        return member.value_span, json.dumps(value)
+        if member is not None:
+            return member.value_span, json.dumps(value)
+        # Planner modes "auto"/"explicit" may invent a pointer the file never had.
+        # _append_member_edit re-emits every existing member from its own source
+        # text, so adding the key costs nothing else in the object.
+        edit = _append_member_edit(text, masked, [], key, value)
+        if edit is None:
+            raise JsoncEditError(f"cannot add top-level {key!r} to this config")
+        return edit
 
     return None
 
@@ -574,6 +722,100 @@ def _verify_edit(new_text: str, config: dict, plans: Sequence[ProviderPlan]) -> 
             "surgical edit changed the config's meaning — refusing to write. "
             "This is a bug in opencode-sync; please report it."
         )
+
+
+# ---------------------------------------------------------------------------
+# opencode state file (~/.local/state/opencode/model.json)
+#
+# opencode's TUI records recently used models there, and its defaultModel()
+# prefers that recent[] list (skipping dead entries) before falling back to
+# "first model in config".  After a server-side rename, stale recent entries
+# are harmless (opencode skips them) but they shadow the config order, so
+# pruning them lets the synced model list actually drive the default.
+# ---------------------------------------------------------------------------
+
+def state_model_json_path() -> Path:
+    """Path of opencode's model.json state file, honoring XDG_STATE_HOME."""
+    state_home = os.environ.get("XDG_STATE_HOME")
+    if state_home:
+        return Path(state_home) / "opencode" / "model.json"
+    return Path.home() / ".local" / "state" / "opencode" / "model.json"
+
+
+def prune_recent_models(
+    path: Optional[Path] = None,
+    live_providers: Optional[Dict[str, object]] = None,
+    model_key_updates: Optional[Dict[str, str]] = None,
+    dry_run: bool = False,
+) -> List[Tuple[str, str]]:
+    """Drop recent[] entries from opencode's state file that no longer resolve.
+
+    An entry is kept when its provider still exists *and* its model ID is present
+    in that provider's models (``live_providers`` maps provider ID -> models dict,
+    i.e. the freshly synced config).  Entries for unknown providers are kept:
+    this tool only knows about providers it syncs.
+
+    If model.json's first recent entry is being dropped and ``model_key_updates``
+    names a replacement, the replacement is prepended so opencode's defaultModel()
+    recent[] lookup lands on the synced model instead of falling through.
+
+    Returns the list of (providerID, modelID) pairs that were removed.
+    The file is only rewritten when something changed and ``dry_run`` is False.
+    """
+    path = path or state_model_json_path()
+    model_key_updates = model_key_updates or {}
+    if not path.exists():
+        return []
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return []  # unreadable/absent state: opencode will cope, so do nothing
+    recent = data.get("recent")
+    if not isinstance(recent, list):
+        return []
+
+    def _is_live(entry: object) -> bool:
+        if not isinstance(entry, dict):
+            return False
+        pid = entry.get("providerID")
+        mid = entry.get("modelID")
+        if not isinstance(pid, str) or not isinstance(mid, str):
+            return False
+        provider = (live_providers or {}).get(pid)
+        if provider is None:
+            return True  # not ours to judge
+        if not isinstance(provider, dict):
+            return False
+        models = provider.get("models")
+        if not isinstance(models, dict):
+            return True  # provider known but model list absent: not ours to judge
+        return mid in models
+
+    removed: List[Tuple[str, str]] = []
+    kept: List[dict] = []
+    for entry in recent:
+        if _is_live(entry):
+            kept.append(entry)
+        elif isinstance(entry, dict) and isinstance(entry.get("providerID"), str) \
+                and isinstance(entry.get("modelID"), str):
+            removed.append((entry["providerID"], entry["modelID"]))
+        # malformed entries are dropped silently — they can't resolve anyway
+
+    if not removed:
+        return []
+
+    for key, value in model_key_updates.items():
+        head, _, rest = value.partition("/")
+        pair = {"providerID": head, "modelID": rest}
+        if all(p != pair for p in kept):
+            kept.insert(0, pair)
+        break  # only seed "model"; small_model is not a recent[] concern
+
+    if not dry_run:
+        data["recent"] = kept
+        _atomic_write_text(path, json.dumps(data) + "\n")
+    return removed
 
 
 def update_provider_models(

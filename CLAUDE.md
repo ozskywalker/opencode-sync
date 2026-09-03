@@ -92,6 +92,21 @@ Model IDs contain slashes (`org/model-a`), so "has a slash" does **not** mean "p
 
 A bare (unqualified) ID is legacy output from an older version of this tool and gets normalized — but only when syncing a single provider, since a bare ID is genuinely ambiguous across several.
 
+### Default-model pointer modes (`--default-model` / `--default-small-model`)
+How opencode picks its default: `config.model` first (a missing model is a hard error, no fallback), then the `recent[]` list in `~/.local/state/opencode/model.json` (dead entries are skipped, not removed), then the first model of the first provider. opencode never discovers models from an `openai-compatible` server — the config's model list *is* the universe.
+
+The planner modes (`_plan_model_key_updates`):
+- `first` (default) — legacy: never invent a pointer, only repair one that already points at the synced provider. This is why a sync of a renamed server didn't used to change what opencode defaults to when no pointer existed.
+- `none` — never touch the keys.
+- `auto` — when this provider's model set actually changed, point the key at the first served model. No-op syncs don't churn the pointer (the wrapper runs on every launch).
+- explicit `provider/model-id` — written whenever it differs, change or no change. Validated against the syncing provider; a pointer naming another provider is rejected.
+
+Cross-provider isolation applies in every mode. `update_active_model=False` (`--no-model-update`) still disables all pointer work.
+
+The surgical editor can now *insert* a top-level `model`/`small_model` key it has never seen (via `_append_member_edit`, which re-emits existing members from source text, so comments survive). It used to be rewrite-only because the planner never invented pointers.
+
+`--prune-recent` drops dead models from the state file's `recent[]` (path honors `XDG_STATE_HOME`; entries for providers this tool doesn't sync are kept — it only judges what it syncs). When the first entry is pruned and a pointer update exists, the pointed-at model is seeded at the head of `recent[]`.
+
 ### Config mutation safety
 `apply_plan` always deep-copies the input dict before modifying it. The caller's dict is never mutated. Tests verify this in `TestUpdateProviderModels::test_original_config_not_mutated`.
 

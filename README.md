@@ -112,6 +112,40 @@ A sync that removes exactly one model and adds exactly one is *assumed* to be a 
 
 That's a guess, and a genuine model swap would inherit the wrong settings — use `--no-infer-renames` to turn it off and drop the old entry instead.
 
+### Which model opencode defaults to
+
+opencode resolves its default model in this order: the top-level `model` key in the config, then its own `recent[]` state file (`~/.local/state/opencode/model.json`), then the first model of the first provider. The sync keeps the provider's model list fresh, but by default it never *creates* a `model` pointer — after a server-side rename, a config that never had one still won't, and opencode falls through to its (possibly stale) recent list.
+
+`--default-model` makes that tunable:
+
+```bash
+# After a model-set change, point config.model at the first served model
+opencode-sync --default-model auto
+
+# Never touch model/small_model at all, not even to repair a stale pointer
+opencode-sync --default-model none --default-small-model none
+
+# Pin an explicit model (provider-qualified)
+opencode-sync --default-model vllm/qwen3.5-122B-A10B
+```
+
+| Mode | Behavior |
+|---|---|
+| `first` (default) | Legacy: never invent a pointer; only repair one that already points at the synced provider |
+| `auto` | When this provider's model set changes, point `model`/`small_model` at the first served model |
+| `none` | Never touch the keys |
+| `provider/model-id` | Explicit pin; written whenever it isn't already there |
+
+`--default-small-model` takes the same values and controls `small_model` independently. A pointer belonging to a different provider is never touched in any mode. `auto` only fires when the model set actually changed, so routine no-op syncs don't churn the config.
+
+If opencode has recently-used leftovers for models that no longer exist, they can shadow the synced default (opencode skips dead entries rather than cleaning them up):
+
+```bash
+opencode-sync --prune-recent   # drop dead models from ~/.local/state/opencode/model.json
+```
+
+Entries for providers this tool doesn't sync are left alone.
+
 ### URL behaviour
 
 | Invocation | Server queried | `baseURL` in config |
@@ -145,6 +179,7 @@ Anything you've written on a model entry survives a sync, as long as the server 
 opencode-sync [--host HOST] [--port PORT] [--provider ID] [--config PATH]
               [--rename OLD=NEW] [--no-infer-renames] [--dry-run]
               [--no-url-update] [--no-model-update] [--timeout SECONDS]
+              [--default-model MODE] [--default-small-model MODE] [--prune-recent]
 ```
 
 | Flag | Default | Description |
@@ -158,6 +193,9 @@ opencode-sync [--host HOST] [--port PORT] [--provider ID] [--config PATH]
 | `--dry-run` | off | Print a diff of the planned changes without writing |
 | `--no-url-update` | off | Don't update `baseURL` even when `--host`/`--port` is given |
 | `--no-model-update` | off | Don't update `model`/`small_model` if the active model is removed |
+| `--default-model MODE` | `first` | Pointer policy: `first`, `none`, `auto`, or explicit `provider/model-id` |
+| `--default-small-model MODE` | `first` | Same, for `small_model` |
+| `--prune-recent` | off | Drop dead models from opencode's `recent[]` state file |
 | `--timeout SECONDS` | 10 | HTTP request timeout |
 
 ## Config file locations

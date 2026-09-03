@@ -17,7 +17,10 @@ from opencode_sync.config import (
     generate_display_name,
     load_config,
     parse_jsonc,
+    plan_provider_update,
+    prune_recent_models,
     save_config,
+    state_model_json_path,
     update_provider_models,
 )
 from tests.conftest import SAMPLE_CONFIG, SAMPLE_JSONC
@@ -442,3 +445,308 @@ class TestUpdateProviderModels:
         original = copy.deepcopy(config)
         update_provider_models(config, "vllm", ["org/model-c"])
         assert config == original
+
+
+# ---------------------------------------------------------------------------
+# Default-model pointer modes (--default-model / --default-small-model)
+# ---------------------------------------------------------------------------
+
+NO_POINTER_CONFIG = {
+    "$schema": "https://opencode.ai/config.json",
+    "provider": {
+        "vllm": {
+            "npm": "@ai-sdk/openai-compatible",
+            "name": "vLLM (local)",
+            "options": {"baseURL": "http://localhost:8080/v1"},
+            "models": {"org/model-a": {"name": "Model A"}},
+        },
+        "other": {
+            "npm": "@ai-sdk/openai-compatible",
+            "name": "Other",
+            "options": {"baseURL": "http://elsewhere:8080/v1"},
+            "models": {"x/model-z": {"name": "Z"}},
+        },
+    },
+}
+
+
+class TestDefaultModelModes:
+    """plan_provider_update with model_mode / small_model_mode."""
+
+    @staticmethod
+    def _plan(config, model_ids, **kw):
+        kw.setdefault("model_mode", "first")
+        kw.setdefault("small_model_mode", "first")
+        return plan_provider_update(
+            config=config, provider_id="vllm", model_ids=model_ids, **kw
+        ).model_key_updates
+
+    # -- "first" (legacy default): never invent, only repair -------------------
+
+    def test_first_never_invents_pointer(self):
+        config = copy.deepcopy(NO_POINTER_CONFIG)
+        del config["provider"]["other"]  # single provider, still no pointer
+        assert self._plan(config, ["org/new"]) == {}
+
+    def test_first_repairs_stale_pointer(self):
+        config = copy.deepcopy(NO_POINTER_CONFIG)
+        del config["provider"]["other"]
+        config["model"] = "vllm/org/dead"
+        assert self._plan(config, ["org/new"]) == {"model": "vllm/org/new"}
+
+    def test_first_ignores_other_providers_pointer(self):
+        config = copy.deepcopy(NO_POINTER_CONFIG)
+        config["model"] = "other/x/model-z"
+        assert self._plan(config, ["org/new"]) == {}
+
+    # -- "none": never touch, not even repair ----------------------------------
+
+    def test_none_leaves_stale_pointer_alone(self):
+        config = copy.deepcopy(NO_POINTER_CONFIG)
+        del config["provider"]["other"]
+        config["model"] = "vllm/org/dead"
+        config["small_model"] = "vllm/org/dead"
+        assert self._plan(
+            config, ["org/new"], model_mode="none", small_model_mode="none"
+        ) == {}
+
+    # -- "auto": point at first served model when the set changes --------------
+
+    def test_auto_invents_pointer_on_change(self):
+        # The headline feature: fresh config, no pointer, server model changed.
+        config = copy.deepcopy(NO_POINTER_CONFIG)
+        del config["provider"]["other"]
+        config["provider"]["vllm"]["models"] = {"org/old": {"name": "Old"}}
+        assert self._plan(
+            config, ["org/new"], model_mode="auto", small_model_mode="auto"
+        ) == {"model": "vllm/org/new", "small_model": "vllm/org/new"}
+
+    def test_auto_noop_when_set_unchanged_and_no_pointer(self):
+        # Routine no-op sync must not invent a pointer (wrapper runs every launch).
+        config = copy.deepcopy(NO_POINTER_CONFIG)
+        del config["provider"]["other"]
+        assert self._plan(
+            config, ["org/model-a"], model_mode="auto", small_model_mode="auto"
+        ) == {}
+
+    def test_auto_keeps_pointer_when_unchanged(self):
+        config = copy.deepcopy(NO_POINTER_CONFIG)
+        del config["provider"]["other"]
+        config["model"] = "vllm/org/model-a"
+        assert self._plan(config, ["org/model-a"], model_mode="auto") == {}
+
+    def test_auto_repairs_stale_pointer(self):
+        config = copy.deepcopy(NO_POINTER_CONFIG)
+        del config["provider"]["other"]
+        config["model"] = "vllm/org/dead"
+        assert self._plan(config, ["org/new"], model_mode="auto") == {
+            "model": "vllm/org/new"
+        }
+
+    def test_auto_respects_other_providers_pointer(self):
+        config = copy.deepcopy(NO_POINTER_CONFIG)
+        config["model"] = "other/x/model-z"
+        config["provider"]["vllm"]["models"] = {"org/old": {"name": "Old"}}
+        # Set changed for vllm but the pointer belongs to 'other' — not ours.
+        assert self._plan(config, ["org/new"], model_mode="auto") == {}
+
+    def test_auto_noop_when_nothing_changed_with_existing_valid_pointer(self):
+        config = copy.deepcopy(NO_POINTER_CONFIG)
+        del config["provider"]["other"]
+        config["model"] = "vllm/org/model-a"
+        config["small_model"] = "vllm/org/model-a"
+        assert self._plan(
+            config, ["org/model-a"], model_mode="auto", small_model_mode="auto"
+        ) == {}
+
+    # -- explicit provider/model ------------------------------------------------
+
+    def test_explicit_sets_pointer_even_without_change(self):
+        config = copy.deepcopy(NO_POINTER_CONFIG)
+        del config["provider"]["other"]
+        assert self._plan(
+            config, ["org/model-a"], model_mode="explicit", explicit_model="vllm/org/model-a"
+        ) == {"model": "vllm/org/model-a"}
+
+    def test_explicit_noop_when_already_correct(self):
+        config = copy.deepcopy(NO_POINTER_CONFIG)
+        del config["provider"]["other"]
+        config["model"] = "vllm/org/model-a"
+        assert self._plan(
+            config, ["org/model-a"], model_mode="explicit", explicit_model="vllm/org/model-a"
+        ) == {}
+
+    def test_explicit_wrong_provider_rejected(self):
+        with pytest.raises(ValueError, match="names provider"):
+            plan_provider_update(
+                config=NO_POINTER_CONFIG,
+                provider_id="vllm",
+                model_ids=["org/model-a"],
+                model_mode="explicit",
+                explicit_model="other/x/model-z",
+            )
+
+    def test_explicit_bare_id_rejected(self):
+        # "org/model-a" looks qualified but 'org' isn't the provider being synced;
+        # either way it must be rejected, never silently guessed at.
+        with pytest.raises(ValueError, match="(provider-qualified|names provider)"):
+            plan_provider_update(
+                config=NO_POINTER_CONFIG,
+                provider_id="vllm",
+                model_ids=["org/model-a"],
+                model_mode="explicit",
+                explicit_model="org/model-a",
+            )
+
+    def test_unknown_mode_rejected(self):
+        with pytest.raises(ValueError, match="unknown default-model mode"):
+            plan_provider_update(
+                config=NO_POINTER_CONFIG,
+                provider_id="vllm",
+                model_ids=["org/model-a"],
+                model_mode="yolo",
+            )
+
+    # -- small_model independence -----------------------------------------------
+
+    def test_small_model_mode_independent_of_model_mode(self):
+        config = copy.deepcopy(NO_POINTER_CONFIG)
+        del config["provider"]["other"]
+        config["provider"]["vllm"]["models"] = {"org/old": {"name": "Old"}}
+        updates = self._plan(
+            config, ["org/new"], model_mode="none", small_model_mode="auto"
+        )
+        assert updates == {"small_model": "vllm/org/new"}
+
+    def test_no_model_update_flag_still_wins(self):
+        # update_active_model=False disables all pointer work, as before.
+        config = copy.deepcopy(NO_POINTER_CONFIG)
+        del config["provider"]["other"]
+        config["provider"]["vllm"]["models"] = {"org/old": {"name": "Old"}}
+        plan = plan_provider_update(
+            config=config,
+            provider_id="vllm",
+            model_ids=["org/new"],
+            update_active_model=False,
+            model_mode="auto",
+            small_model_mode="auto",
+        )
+        assert plan.model_key_updates == {}
+
+    # -- noop plan accounting ----------------------------------------------------
+
+    def test_explicit_pointer_change_makes_plan_not_noop(self):
+        config = copy.deepcopy(NO_POINTER_CONFIG)
+        del config["provider"]["other"]
+        plan = plan_provider_update(
+            config=config,
+            provider_id="vllm",
+            model_ids=["org/model-a"],
+            model_mode="explicit",
+            explicit_model="vllm/org/model-a",
+        )
+        assert not plan.is_noop()
+
+    def test_first_mode_plan_is_noop_when_only_pointer_would_invent(self):
+        config = copy.deepcopy(NO_POINTER_CONFIG)
+        del config["provider"]["other"]
+        plan = self._plan(config, ["org/model-a"])
+        # (indirect: _plan returns {} so plan must be a no-op)
+        plan2 = plan_provider_update(config=config, provider_id="vllm", model_ids=["org/model-a"])
+        assert plan2.is_noop()
+        assert plan == {}
+
+
+# ---------------------------------------------------------------------------
+# --prune-recent: opencode state file pruning
+# ---------------------------------------------------------------------------
+
+class TestPruneRecentModels:
+    def _state_file(self, tmp_path, recent):
+        path = tmp_path / "model.json"
+        path.write_text(json.dumps({"recent": recent, "favorite": []}), encoding="utf-8")
+        return path
+
+    @staticmethod
+    def _live():
+        return {
+            "vllm": {"models": {"org/model-a": {}, "org/model-b": {}}},
+            "other": {"models": {"x/model-z": {}}},
+        }
+
+    def test_missing_file_is_noop(self, tmp_path):
+        removed = prune_recent_models(path=tmp_path / "nope.json", live_providers=self._live())
+        assert removed == []
+
+    def test_stale_entry_removed(self, tmp_path):
+        path = self._state_file(tmp_path, [
+            {"providerID": "vllm", "modelID": "org/dead"},
+            {"providerID": "vllm", "modelID": "org/model-a"},
+        ])
+        removed = prune_recent_models(path=path, live_providers=self._live())
+        assert removed == [("vllm", "org/dead")]
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert [e["modelID"] for e in data["recent"]] == ["org/model-a"]
+        assert data["favorite"] == []  # untouched
+
+    def test_unknown_provider_entries_kept(self, tmp_path):
+        path = self._state_file(tmp_path, [
+            {"providerID": "mystery", "modelID": "whatever"},
+        ])
+        removed = prune_recent_models(path=path, live_providers=self._live())
+        assert removed == []
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert len(data["recent"]) == 1
+
+    def test_provider_without_models_dict_kept(self, tmp_path):
+        path = self._state_file(tmp_path, [
+            {"providerID": "mystery", "modelID": "whatever"},
+        ])
+        removed = prune_recent_models(path=path, live_providers={"mystery": {}})
+        assert removed == []
+
+    def test_no_removals_no_rewrite(self, tmp_path):
+        path = self._state_file(tmp_path, [{"providerID": "vllm", "modelID": "org/model-a"}])
+        before = path.read_text(encoding="utf-8")
+        prune_recent_models(path=path, live_providers=self._live())
+        assert path.read_text(encoding="utf-8") == before
+
+    def test_model_key_update_seeds_recent_head(self, tmp_path):
+        path = self._state_file(tmp_path, [
+            {"providerID": "vllm", "modelID": "org/dead"},
+        ])
+        prune_recent_models(
+            path=path,
+            live_providers=self._live(),
+            model_key_updates={"model": "vllm/org/model-b"},
+        )
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert data["recent"][0] == {"providerID": "vllm", "modelID": "org/model-b"}
+
+    def test_dry_run_does_not_write(self, tmp_path):
+        path = self._state_file(tmp_path, [{"providerID": "vllm", "modelID": "org/dead"}])
+        before = path.read_text(encoding="utf-8")
+        removed = prune_recent_models(
+            path=path, live_providers=self._live(), dry_run=True
+        )
+        assert removed == [("vllm", "org/dead")]
+        assert path.read_text(encoding="utf-8") == before
+
+    def test_corrupt_file_is_ignored(self, tmp_path):
+        path = tmp_path / "model.json"
+        path.write_text("{not json", encoding="utf-8")
+        assert prune_recent_models(path=path, live_providers=self._live()) == []
+
+    def test_non_list_recent_ignored(self, tmp_path):
+        path = tmp_path / "model.json"
+        path.write_text(json.dumps({"recent": "bogus"}), encoding="utf-8")
+        assert prune_recent_models(path=path, live_providers=self._live()) == []
+
+    def test_state_path_honors_xdg_state_home(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        assert state_model_json_path() == tmp_path / "opencode" / "model.json"
+
+    def test_state_path_default(self, monkeypatch):
+        monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+        expected = Path.home() / ".local" / "state" / "opencode" / "model.json"
+        assert state_model_json_path() == expected

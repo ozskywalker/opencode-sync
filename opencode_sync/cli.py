@@ -9,9 +9,10 @@ import stat
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from .config import (
+    DEFAULT_MODEL_MODES,
     ProviderPlan,
     apply_plan,
     apply_plans_to_text,
@@ -20,6 +21,7 @@ from .config import (
     load_config,
     load_config_text,
     plan_provider_update,
+    prune_recent_models,
     save_config,
     save_config_text,
 )
@@ -151,6 +153,34 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Don't update model/small_model even if the active model is removed",
     )
     p.add_argument(
+        "--default-model",
+        default=None,
+        metavar="MODE",
+        help=(
+            "How the top-level 'model' pointer is managed: 'first' (default: only "
+            "repair an existing pointer), 'none' (never touch it), 'auto' (point it "
+            "at the first served model whenever this provider's model set changes), "
+            "or an explicit 'provider/model-id'"
+        ),
+    )
+    p.add_argument(
+        "--default-small-model",
+        default=None,
+        metavar="MODE",
+        help=(
+            "How 'small_model' is managed; same values as --default-model "
+            "(default: 'first')"
+        ),
+    )
+    p.add_argument(
+        "--prune-recent",
+        action="store_true",
+        help=(
+            "Drop dead models from opencode's recent[] state file "
+            "(~/.local/state/opencode/model.json) so they can't shadow the default"
+        ),
+    )
+    p.add_argument(
         "--rename",
         action="append",
         default=None,
@@ -186,6 +216,32 @@ def _parse_renames(values: Optional[List[str]]) -> Dict[str, str]:
             _die(f"--rename expects OLD=NEW, got {item!r}.")
         renames[old] = new
     return renames
+
+
+def _resolve_pointer_flags(args) -> Tuple[str, str, Optional[str], Optional[str]]:
+    """Normalize --default-model/--default-small-model into planner arguments.
+
+    An explicit 'provider/model-id' sets the mode to a marker that the planner
+    validates per-provider (it dies if the named provider isn't the one syncing).
+    Values are validated here so typos fail before any server is queried.
+    """
+    model_mode = (args.default_model or "first").strip()
+    small_mode = (args.default_small_model or "first").strip()
+    explicit_model = explicit_small = None
+
+    def _split(value: str):
+        if value in DEFAULT_MODEL_MODES:
+            return value, None
+        if "/" in value:
+            return "explicit", value
+        _die(
+            f"--default-model expects 'first', 'none', 'auto', or 'provider/model-id', "
+            f"got {value!r}."
+        )
+
+    model_mode, explicit_model = _split(model_mode)
+    small_mode, explicit_small = _split(small_mode)
+    return model_mode, small_mode, explicit_model, explicit_small
 
 
 def _cmd_install(args) -> int:
@@ -333,7 +389,9 @@ def _resolve_targets(args, config: dict, target_specified: bool, host: str, port
     return targets
 
 
-def _sync_one(args, config: dict, target: Target, renames: Dict[str, str], single: bool):
+def _sync_one(args, config: dict, target: Target, renames: Dict[str, str], single: bool,
+              model_mode: str = "first", small_model_mode: str = "first",
+              explicit_model: Optional[str] = None, explicit_small_model: Optional[str] = None):
     """Query one server and plan its update.
 
     Returns (plan, failed).  A plan of None means "nothing to do"; failed says
@@ -372,6 +430,10 @@ def _sync_one(args, config: dict, target: Target, renames: Dict[str, str], singl
         renames=renames,
         infer_renames=not args.no_infer_renames,
         normalize_bare_ids=single,
+        model_mode=model_mode,
+        small_model_mode=small_model_mode,
+        explicit_model=explicit_model,
+        explicit_small_model=explicit_small_model,
     )
     _report(plan, config)
     return plan, False
@@ -404,6 +466,8 @@ def main(argv=None) -> int:
 
     config_path = _resolve_config_path(args.config)
     renames = _parse_renames(args.rename)
+    model_mode, small_model_mode, explicit_model, explicit_small_model = (
+        _resolve_pointer_flags(args))
     env_host = _env_value(LLAMA_HOST_ENV)
     env_port = _env_port()
     target_specified = (
@@ -446,7 +510,13 @@ def main(argv=None) -> int:
     plans = []
     failures = 0
     for target in targets:
-        plan, failed = _sync_one(args, config, target, renames, single)
+        plan, failed = _sync_one(
+            args, config, target, renames, single,
+            model_mode=model_mode,
+            small_model_mode=small_model_mode,
+            explicit_model=explicit_model,
+            explicit_small_model=explicit_small_model,
+        )
         failures += bool(failed)
         if plan is not None:
             plans.append(plan)
@@ -502,7 +572,32 @@ def main(argv=None) -> int:
         _die(f"Failed to write config: {e}")
 
     print(f"\nConfig saved: {config_path}")
+
+    if args.prune_recent:
+        # The freshly written config defines what "live" means.
+        final = config
+        for plan in plans:
+            final = apply_plan(final, plan)
+        removed = prune_recent_models(
+            live_providers=final.get("provider", {}),
+            model_key_updates=final_model_key_updates(plans),
+        )
+        if removed:
+            print(
+                "Pruned from recent[]: "
+                + ", ".join(f"{pid}/{mid}" for pid, mid in removed)
+            )
+        else:
+            print("recent[]: nothing to prune.")
     return 0
+
+
+def final_model_key_updates(plans: List[ProviderPlan]) -> Dict[str, str]:
+    """Merge every plan's model/small_model pointer updates, last plan wins."""
+    merged: Dict[str, str] = {}
+    for plan in plans:
+        merged.update(plan.model_key_updates)
+    return merged
 
 
 if __name__ == "__main__":
