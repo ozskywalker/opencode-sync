@@ -180,6 +180,7 @@ opencode-sync [--host HOST] [--port PORT] [--provider ID] [--config PATH]
               [--rename OLD=NEW] [--no-infer-renames] [--dry-run]
               [--no-url-update] [--no-model-update] [--timeout SECONDS]
               [--default-model MODE] [--default-small-model MODE] [--prune-recent]
+              [--version] [--no-update-check]
 ```
 
 | Flag | Default | Description |
@@ -197,6 +198,33 @@ opencode-sync [--host HOST] [--port PORT] [--provider ID] [--config PATH]
 | `--default-small-model MODE` | `first` | Same, for `small_model` |
 | `--prune-recent` | off | Drop dead models from opencode's `recent[]` state file |
 | `--timeout SECONDS` | 10 | HTTP request timeout |
+| `--version` | — | Print `opencode-sync <version>` and exit |
+| `--no-update-check` | off | Skip the PyPI check for a newer release |
+
+## Version banner and update checks
+
+Every invocation prints its version as the first line of stdout:
+
+```
+opencode-sync v0.5.0
+```
+
+After the work completes (sync, install, or nothing-to-do), the tool checks
+PyPI for a newer release. If one exists, a notice is printed:
+
+```
+---
+Update available: opencode-sync 0.6.0 (you have 0.5.0) — https://pypi.org/project/opencode-sync/
+```
+
+Properties of the check:
+
+- **Best-effort and silent on failure** — network errors, timeouts, and bad
+  responses produce no output and never change the exit code.
+- **1-second timeout**, and it runs *after* the config work, never before.
+- **Dev builds don't nag** — a version like `0.5.0.dev1+g4b58801` (setuptools-scm
+  output on a checkout ahead of the last tag) skips the check entirely.
+- **Opt out** with `--no-update-check` (useful on air-gapped machines).
 
 ## Config file locations
 
@@ -211,6 +239,6 @@ Override with `--config PATH`.
 
 ```bash
 pip install -e ".[dev]"
-python -m pytest                      # 205 tests
+python -m pytest                      # ~298 tests
 python -m pytest --cov=opencode_sync  # with coverage
 ```
