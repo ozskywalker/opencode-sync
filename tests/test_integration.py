@@ -66,6 +66,66 @@ class TestFullSync:
         updated = load_config(cfg)
         assert updated["provider"]["vllm"]["models"]["org/brand-new-model"]["name"] == "brand-new-model"
 
+    def test_server_rename_refreshes_display_name(self, tmp_path, mock_server, capsys):
+        # The reported scenario: one model ID swapped for another, the old entry
+        # carrying a display name that no longer matches.  The sync infers the
+        # rename, keeps the tuned settings, and gives the entry a fresh name.
+        cfg = tmp_path / "opencode.jsonc"
+        config = json.dumps({
+            "provider": {
+                "spark-2dd4": {
+                    "npm": "@ai-sdk/openai-compatible",
+                    "name": "spark-2dd4",
+                    "options": {"baseURL": "http://localhost:8000/v1"},
+                    "models": {
+                        "deepseek-v4-flash": {
+                            "name": "DeepSeek-V4-Flash-0731",
+                            "limit": {"context": 262144, "output": 32768},
+                        },
+                    },
+                },
+            },
+            "model": "spark-2dd4/deepseek-v4-flash",
+        }, indent=2)
+        cfg.write_text(config, encoding="utf-8")
+
+        srv = mock_server(["glm-5.3-flash-exl3-v2"])
+        rc = main([
+            "--config", str(cfg),
+            "--host", "127.0.0.1", "--port", str(srv.port),
+        ])
+        assert rc == 0
+
+        updated = load_config(cfg)
+        entry = updated["provider"]["spark-2dd4"]["models"]["glm-5.3-flash-exl3-v2"]
+        assert "deepseek-v4-flash" not in updated["provider"]["spark-2dd4"]["models"]
+        assert entry["name"] == "glm-5.3-flash-exl3-v2", (
+            "display name must follow the renamed model ID"
+        )
+        assert entry["limit"] == {"context": 262144, "output": 32768}
+        assert updated["model"] == "spark-2dd4/glm-5.3-flash-exl3-v2"
+        # The inference is reported, including which keys were kept.
+        out = capsys.readouterr().out
+        assert "~ Renamed: deepseek-v4-flash -> glm-5.3-flash-exl3-v2" in out
+        assert "kept limit" in out
+
+    def test_server_rename_via_flag_refreshes_display_name(self, tmp_path, mock_server):
+        cfg = tmp_path / "opencode.jsonc"
+        write_sample_config(cfg)
+
+        srv = mock_server(["org/renamed-a"])
+        rc = main([
+            "--config", str(cfg),
+            "--host", "127.0.0.1", "--port", str(srv.port),
+            "--rename", "org/model-a=org/renamed-a",
+        ])
+        assert rc == 0
+
+        updated = load_config(cfg)
+        entry = updated["provider"]["vllm"]["models"]["org/renamed-a"]
+        assert entry["name"] == "renamed-a"  # was "Model A"
+        assert "org/model-a" not in updated["provider"]["vllm"]["models"]
+
     def test_updates_base_url_when_host_specified(self, tmp_path, mock_server):
         cfg = tmp_path / "opencode.jsonc"
         write_sample_config(cfg)
