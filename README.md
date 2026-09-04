@@ -67,7 +67,7 @@ On each run, `opencode-sync`:
 
 1. Works out which providers to sync (see [Which providers get synced](#which-providers-get-synced))
 2. Fetches each one's live model list from `GET /v1/models`
-3. Rebuilds that provider's `models` — surviving IDs keep their entry exactly as you wrote it; new IDs get a generated name from the model ID
+3. Rebuilds that provider's `models` — surviving IDs keep their entry exactly as you wrote it; renamed IDs keep their entry but get a fresh generated name; new IDs get a generated name from the model ID
 4. If `model` or `small_model` points at *this* provider and its model is gone, repoints it to the first available one
 5. Rewrites only those parts of the file
 
@@ -102,7 +102,7 @@ If a server starts reporting a different ID for what is really the same model, a
 opencode-sync --provider vllm --rename aeon=qwen3.5-122B-A10B
 ```
 
-This moves the entry — display name, context limits, sampling options, comments and all — to the new ID.
+This moves the entry — context limits, sampling options, comments and all — to the new ID. The display **name** is *not* carried over: it described the old model ID, so the entry gets a fresh generated name (the ID's last path segment). Any other customisation rides along untouched.
 
 A sync that removes exactly one model and adds exactly one is *assumed* to be a rename, but only when the old entry has settings worth keeping. It'll tell you when it does this:
 
@@ -165,7 +165,7 @@ Anything you've written on a model entry survives a sync, as long as the server 
 ```jsonc
 "models": {
   "org/Qwen3-27B": {
-    "name": "My Qwen label",       // kept
+    "name": "My Qwen label",       // kept as long as the ID survives
     "limit": { "context": 229376 }, // kept
     // Even this comment is kept.
     "options": { "temperature": 0.6 }
