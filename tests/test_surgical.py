@@ -191,6 +191,64 @@ class TestRename:
         plan = plan_provider_update(cfg, "p", ["c", "d"])
         assert plan.renames == {}
 
+    def test_rename_refreshes_display_name(self):
+        # Regression for the user report: the entry moves to the new ID but the
+        # display name must not keep describing the old model.
+        text = (
+            "{\n"
+            '  "provider": {\n'
+            '    "p": {\n'
+            '      "models": {\n'
+            '        "old": {\n'
+            '          "name": "DeepSeek-V4-Flash-0731",\n'
+            '          "limit": {"context": 262144, "output": 32768}\n'
+            "        }\n"
+            "      }\n"
+            "    }\n"
+            "  }\n"
+            "}\n"
+        )
+        cfg = parse_jsonc(text)
+        plan = plan_provider_update(cfg, "p", ["glm-5.3-flash-exl3-v2"])
+        out = apply_plans_to_text(text, cfg, [plan])
+        entry = parse_jsonc(out)["provider"]["p"]["models"]["glm-5.3-flash-exl3-v2"]
+        assert entry["name"] == "glm-5.3-flash-exl3-v2"
+        assert entry["limit"] == {"context": 262144, "output": 32768}
+
+    def test_rename_refresh_splices_only_the_name_value(self, text, config):
+        # With the fixture's generic name the diff would be identical either way,
+        # so use a distinctive display name and assert every other byte survives.
+        marker = '"name": "Totally Custom Label"'
+        patched = text.replace('"name": "qwen3.5-122B-A10B"', marker)
+        cfg = parse_jsonc(patched)
+        plan = plan_provider_update(cfg, "node-c3d4", ["brand-new-id"])
+        out = apply_plans_to_text(patched, cfg, [plan])
+        entry = parse_jsonc(out)["provider"]["node-c3d4"]["models"]["brand-new-id"]
+        assert entry["name"] == "brand-new-id"
+        assert entry["limit"]["context"] == 196608
+        assert out.count(COMMENT) == 2  # comments inside the entry ride along
+        # The trailing comment attached to the entry's last member survives.
+        assert "     // trailing" not in out  # sanity: fixture has none
+
+    def test_rename_without_name_key_gains_none(self):
+        text = (
+            "{\n"
+            '  "provider": {\n'
+            '    "p": {\n'
+            '      "models": {\n'
+            '        "old": {"limit": {"context": 1}}\n'
+            "      }\n"
+            "    }\n"
+            "  }\n"
+            "}\n"
+        )
+        cfg = parse_jsonc(text)
+        plan = plan_provider_update(cfg, "p", ["new"])
+        out = apply_plans_to_text(text, cfg, [plan])
+        entry = parse_jsonc(out)["provider"]["p"]["models"]["new"]
+        assert "name" not in entry
+        assert entry["limit"] == {"context": 1}
+
 
 class TestCrossProviderIsolation:
     def test_syncing_one_provider_leaves_the_others_pointer_alone(self, config):

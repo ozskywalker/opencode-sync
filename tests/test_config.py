@@ -12,6 +12,7 @@ import pytest
 
 from opencode_sync.config import (
     _strip_jsonc_comments,
+    apply_plan,
     find_config_path,
     find_provider_by_url,
     generate_display_name,
@@ -750,3 +751,98 @@ class TestPruneRecentModels:
         monkeypatch.delenv("XDG_STATE_HOME", raising=False)
         expected = Path.home() / ".local" / "state" / "opencode" / "model.json"
         assert state_model_json_path() == expected
+
+
+# ---------------------------------------------------------------------------
+# Renames refresh the display name
+#
+# Regression: moving an entry to a new model ID carried the old display name
+# with it, so opencode kept showing e.g. "DeepSeek-V4-Flash-0731" after the
+# server had started serving glm-5.3-flash-exl3-v2.
+# ---------------------------------------------------------------------------
+
+RENAME_CONFIG = {
+    "provider": {
+        "spark-2dd4": {
+            "npm": "@ai-sdk/openai-compatible",
+            "name": "spark-2dd4",
+            "options": {"baseURL": "http://spark-2dd4:8000/v1"},
+            "models": {
+                "deepseek-v4-flash": {
+                    "name": "DeepSeek-V4-Flash-0731",
+                    "limit": {"context": 262144, "output": 32768},
+                },
+            },
+        },
+    },
+}
+
+
+class TestRenameRefreshesDisplayName:
+    def _config(self):
+        return copy.deepcopy(RENAME_CONFIG)
+
+    def test_dict_path_refreshes_name(self):
+        plan = plan_provider_update(self._config(), "spark-2dd4", ["glm-5.3-flash-exl3-v2"])
+        assert plan.renames == {"deepseek-v4-flash": "glm-5.3-flash-exl3-v2"}
+        updated = apply_plan(self._config(), plan)
+        entry = updated["provider"]["spark-2dd4"]["models"]["glm-5.3-flash-exl3-v2"]
+        assert entry["name"] == "glm-5.3-flash-exl3-v2"
+        # The rest of the entry still rides along.
+        assert entry["limit"] == {"context": 262144, "output": 32768}
+
+    def test_dict_path_refreshes_name_for_explicit_renames(self):
+        config = self._config()
+        config["provider"]["spark-2dd4"]["models"]["extra"] = {"name": "Extra"}
+        plan = plan_provider_update(
+            self._config(), "spark-2dd4",
+            ["glm-5.3-flash-exl3-v2", "extra"],
+            renames={"deepseek-v4-flash": "glm-5.3-flash-exl3-v2"},
+        )
+        updated = apply_plan(config, plan)
+        entry = updated["provider"]["spark-2dd4"]["models"]["glm-5.3-flash-exl3-v2"]
+        assert entry["name"] == "glm-5.3-flash-exl3-v2"
+        # A surviving (not-renamed) entry keeps its display name.
+        assert updated["provider"]["spark-2dd4"]["models"]["extra"]["name"] == "Extra"
+
+    def test_dict_path_keeps_untouched_entry_names(self):
+        # A plain sync that adds/removes without any rename never rewrites names.
+        config = self._config()
+        config["provider"]["spark-2dd4"]["models"]["other"] = {"name": "Custom"}
+        plan = plan_provider_update(config, "spark-2dd4", ["deepseek-v4-flash", "added"])
+        assert plan.renames == {}
+        updated = apply_plan(config, plan)
+        models = updated["provider"]["spark-2dd4"]["models"]
+        assert models["deepseek-v4-flash"]["name"] == "DeepSeek-V4-Flash-0731"
+        assert models["added"]["name"] == "added"
+
+    def test_dict_path_no_name_key_stays_nameless(self):
+        # An entry that deliberately has no "name" key must not gain one.
+        config = self._config()
+        config["provider"]["spark-2dd4"]["models"] = {
+            "old": {"limit": {"context": 1}},
+        }
+        plan = plan_provider_update(config, "spark-2dd4", ["new"])
+        updated = apply_plan(config, plan)
+        entry = updated["provider"]["spark-2dd4"]["models"]["new"]
+        assert "name" not in entry
+        assert entry["limit"] == {"context": 1}
+
+    def test_dict_path_original_not_mutated_by_rename(self):
+        config = self._config()
+        original = copy.deepcopy(config)
+        plan = plan_provider_update(config, "spark-2dd4", ["glm-5.3-flash-exl3-v2"])
+        apply_plan(config, plan)
+        assert config == original
+
+    def test_rename_onto_surviving_id_refreshes_name(self):
+        # Server order lists both IDs; only the renamed one is rewritten.
+        config = self._config()
+        config["provider"]["spark-2dd4"]["models"]["keep"] = {"name": "Keep Me"}
+        plan = plan_provider_update(
+            config, "spark-2dd4", ["keep", "glm-5.3-flash-exl3-v2"]
+        )
+        updated = apply_plan(config, plan)
+        models = updated["provider"]["spark-2dd4"]["models"]
+        assert models["keep"]["name"] == "Keep Me"
+        assert models["glm-5.3-flash-exl3-v2"]["name"] == "glm-5.3-flash-exl3-v2"

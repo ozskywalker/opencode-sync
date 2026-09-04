@@ -84,6 +84,7 @@ Newlines inside block comments are preserved when masking, so `JSONDecodeError` 
 This is keyed on the model **ID**, so a server-side rename would drop everything. Hence renames:
 - `--rename OLD=NEW` moves an entry's whole body (and, on the text path, its comments) to a new ID.
 - A 1-removed/1-added sync is *inferred* as a rename, but only when the removed entry carries keys beyond `name` — i.e. only when there is hand-tuning worth rescuing. It's a heuristic, so the CLI reports every inference it acts on and `--no-infer-renames` turns it off.
+- A renamed entry's `name` is **regenerated from the new ID** (when the entry has one): the old display name described the old ID, and opencode shows it in the picker, so carrying it over made every rename look like a failed sync. Everything else in the entry survives. An entry with no `name` key gains none. On the text path this splices only the name's value span, so comments around it survive byte-for-byte (`_renamed_entry_text`).
 
 ### model / small_model pointers (don't regress this)
 Only ever repoint a pointer that belongs to the provider being synced. Syncing provider B must never touch a pointer aimed at provider A.

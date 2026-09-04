@@ -477,6 +477,15 @@ def apply_plan(config: dict, plan: ProviderPlan) -> dict:
     existing_models: Dict = provider.get("models", {})
     carried = {new: existing_models[old] for old, new in plan.renames.items()
                if old in existing_models}
+    # A renamed entry keeps its tuned settings but gets a fresh display name:
+    # the old name described the old model ID, and opencode surfaces it in the
+    # picker, so leaving it stale makes the sync look like it failed.  An entry
+    # that had no explicit name keeps having none, matching the text path.
+    for new, entry in carried.items():
+        if isinstance(entry, dict) and "name" in entry:
+            entry = dict(entry)  # shallow copy: this entry is ours to change
+            entry["name"] = generate_display_name(new)
+            carried[new] = entry
 
     # Rebuild in server order: surviving and renamed entries keep their bodies verbatim,
     # so customised display names and hand-tuned settings ride through the sync.
@@ -564,9 +573,14 @@ def _models_edit(text: str, masked: str, plan: ProviderPlan):
     for mid in plan.model_ids:
         origin = existing.get(source.get(mid, mid))
         if origin is not None:
+            value = origin.value
+            if mid in plan.renames.values():
+                # Renamed entry: the body rides along (settings, comments), but the
+                # display name described the old ID, so swap in a fresh one.
+                value = _renamed_entry_text(origin, mid)
             # Re-splice the original source text, so comments *inside* the entry ride along.
             entries.append(
-                RenderEntry(origin.leading, json.dumps(mid), origin.value, origin.trailing)
+                RenderEntry(origin.leading, json.dumps(mid), value, origin.trailing)
             )
         else:
             entries.append(
@@ -578,6 +592,35 @@ def _models_edit(text: str, masked: str, plan: ProviderPlan):
                 )
             )
     return _rebuild_object_edit(text, masked, member, entries)
+
+
+def _renamed_entry_text(origin: RenderEntry, new_id: str) -> str:
+    """The original entry's source text with only its "name" member rewritten.
+
+    Splicing the original body keeps comments and every other key byte-identical;
+    the name member is replaced with a generated display name for the new ID.
+    An entry that had no explicit ``name`` key keeps having none, and a body that
+    cannot be scanned falls back to the same re-render the dict path applies.
+    """
+    entry_text = origin.value
+    entry_masked = mask_trailing_commas(mask_comments(entry_text))
+    if not entry_masked.lstrip().startswith("{"):
+        # Not an object body; the dict path replaced it wholesale, mirror that.
+        return _render_value({"name": generate_display_name(new_id)}, "", "  ")
+    try:
+        obj = find_object_members(
+            entry_masked, Span(entry_masked.index("{"), entry_masked.rindex("}") + 1)
+        )
+    except JsoncEditError:
+        return _render_value({"name": generate_display_name(new_id)}, "", "  ")
+    name_member = None
+    for m in obj.members:
+        if m.key == "name":
+            name_member = m  # last wins, matching json.loads
+    if name_member is None:
+        return entry_text  # no explicit "name" key — nothing stale to fix
+    fresh = _render_value(generate_display_name(new_id), "", "  ")
+    return entry_text[: name_member.value_span.start] + fresh + entry_text[name_member.value_span.end :]
 
 
 def _append_member_edit(text: str, masked: str, parent_path: Sequence[str], key: str, value):
