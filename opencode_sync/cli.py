@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import json
 import os
 import stat
 import sys
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from .config import (
     DEFAULT_MODEL_MODES,
@@ -32,6 +34,11 @@ DEFAULT_PORT = 8080
 LLAMA_HOST_ENV = "LLAMA_ARG_HOST"
 LLAMA_PORT_ENV = "LLAMA_ARG_PORT"
 
+PYPI_PACKAGE_NAME = "opencode-sync"
+PYPI_JSON_URL = f"https://pypi.org/pypi/{PYPI_PACKAGE_NAME}/json"
+PYPI_PROJECT_URL = f"https://pypi.org/project/{PYPI_PACKAGE_NAME}/"
+UPDATE_CHECK_TIMEOUT = 1  # seconds; must never delay a real run noticeably
+
 _WRAPPER_TEMPLATE = """\
 #!/bin/sh
 # Written by: opencode-sync install
@@ -42,6 +49,103 @@ exec {opencode_bin} "$@"
 
 _DEFAULT_WRAPPER = Path.home() / ".local" / "bin" / "opencode"
 _DEFAULT_OPENCODE_BIN = Path.home() / ".opencode" / "bin" / "opencode"
+
+
+def _get_version() -> str:
+    """Resolve the running version: installed metadata first, package fallback.
+
+    importlib.metadata is authoritative for installed copies (including
+    setuptools-scm dev versions like 0.5.0.dev1+g4b58801); __version__ covers
+    running from a bare checkout with no install.
+    """
+    try:
+        import importlib.metadata
+
+        return importlib.metadata.version(PYPI_PACKAGE_NAME)
+    except Exception:
+        from . import __version__
+
+        return __version__
+
+
+def _print_banner() -> None:
+    print(f"opencode-sync v{_get_version()}")
+
+
+def _release_segments(version: str) -> Optional[Tuple[int, ...]]:
+    """Extract the leading numeric release segments from a version string.
+
+    Returns None for anything that isn't a plain release: pre-releases
+    (0.6.0rc1), dev builds (0.5.0.dev1+g4b58801), or garbage.  A trailing
+    local segment (+local) is stripped first and does not disqualify.
+    Callers treat None as "don't compare".
+    """
+    head = version.split("+", 1)[0].strip()
+    parts = head.split(".")
+    segments = []
+    for part in parts:
+        # str.isdigit() accepts non-ASCII digit glyphs (superscripts etc.) that
+        # int() rejects, so require plain ASCII 0-9 explicitly.
+        if not (part.isascii() and part.isdigit()):
+            return None
+        segments.append(int(part))
+    return tuple(segments) if segments else None
+
+
+def _is_newer_release(pypi_version: str, local_version: str) -> bool:
+    """True only when pypi_version is a strictly newer plain release than local.
+
+    Dev/pre-release local versions (0.5.0.dev1+g...) never trigger an update
+    nag: a dev checkout sits between releases and comparing it to one is noise.
+    Malformed versions fail safe (no nag) rather than false-positive.
+    """
+    local = _release_segments(local_version)
+    remote = _release_segments(pypi_version)
+    if local is None or remote is None:
+        return False
+    return remote > local
+
+
+def _pypi_http_get_json(url: str, timeout: int) -> dict:
+    """Fetch a JSON document with stdlib urllib. Raises on any failure."""
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _check_pypi_update(
+    _http_get_json: Callable[[str, int], dict] = _pypi_http_get_json,
+) -> Optional[str]:
+    """Return a one-line update notice when PyPI has a newer release, else None.
+
+    Strictly best-effort: every failure mode (network, HTTP, JSON, timeout)
+    is swallowed — this must never disturb the run that just completed.
+    """
+    version = _get_version()
+    try:
+        if _release_segments(version) is None:
+            return None  # dev/pre-release build: never nag
+        data = _http_get_json(PYPI_JSON_URL, UPDATE_CHECK_TIMEOUT)
+        latest = data["info"]["version"]
+        if not isinstance(latest, str) or not _is_newer_release(latest, version):
+            return None
+    except Exception:
+        # Fetched payload, parsing, and comparison are all inside the swallow
+        # guard: a hostile/garbage PyPI response must never crash the caller.
+        return None
+    return (
+        f"Update available: {PYPI_PACKAGE_NAME} {latest} "
+        f"(you have {version}) — {PYPI_PROJECT_URL}"
+    )
+
+
+def _report_update_check(enabled: bool) -> None:
+    if not enabled:
+        return
+    notice = _check_pypi_update()
+    if notice:
+        print("\n---")
+        print(notice)
 
 
 def _find_opencode_bin(wrapper_path: Path) -> Optional[Path]:
@@ -70,6 +174,16 @@ def _build_parser() -> argparse.ArgumentParser:
             "(use --no-url-update to suppress)."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument(
+        "--version",
+        action="version",
+        version=f"opencode-sync v{_get_version()}",
+    )
+    p.add_argument(
+        "--no-update-check",
+        action="store_true",
+        help="Skip the PyPI check for a newer opencode-sync release",
     )
     sub = p.add_subparsers(dest="subcommand")
 
@@ -266,6 +380,7 @@ def _cmd_install(args) -> int:
             f"ERROR: {wrapper_path} already exists. Use --force to overwrite.",
             file=sys.stderr,
         )
+        _report_update_check(not args.no_update_check)
         return 1
 
     wrapper_path.parent.mkdir(parents=True, exist_ok=True)
@@ -295,6 +410,7 @@ def _cmd_install(args) -> int:
             file=sys.stderr,
         )
 
+    _report_update_check(not args.no_update_check)
     return 0
 
 
@@ -322,8 +438,9 @@ def _resolve_config_path(explicit: Optional[Path]) -> Path:
     return detected  # type: ignore[return-value]
 
 
-def _die(msg: str, code: int = 1) -> None:
+def _die(msg: str, code: int = 1, update_check: bool = False) -> None:
     print(f"ERROR: {msg}", file=sys.stderr)
+    _report_update_check(update_check)
     sys.exit(code)
 
 
@@ -407,7 +524,7 @@ def _sync_one(args, config: dict, target: Target, renames: Dict[str, str], singl
         # discovered from the config is a warning, so one box being off doesn't
         # block the others.
         if single:
-            _die(str(e))
+            _die(str(e), update_check=not args.no_update_check)
         print(f"WARNING: {target.provider_id}: {e} — skipping.", file=sys.stderr)
         return None, True
 
@@ -458,8 +575,10 @@ def _report(plan: ProviderPlan, config: dict) -> None:
 
 
 def main(argv=None) -> int:
+    _print_banner()
     parser = _build_parser()
     args = parser.parse_args(argv)
+    update_check_enabled = not args.no_update_check
 
     if args.subcommand == "install":
         return _cmd_install(args)
@@ -524,11 +643,14 @@ def main(argv=None) -> int:
     if not plans:
         if failures:
             print("Nothing synced.", file=sys.stderr)
+            _report_update_check(update_check_enabled)
             return 1
+        _report_update_check(update_check_enabled)
         return 0  # servers were reachable, there was just nothing to apply
 
     if all(plan.is_noop() for plan in plans):
         print("\nConfig already up to date.")
+        _report_update_check(update_check_enabled)
         return 0
 
     # ------------------------------------------------------------------ #
@@ -558,6 +680,7 @@ def main(argv=None) -> int:
             )
             sys.stdout.writelines(diff)
         print("\n[dry-run] Config not written.")
+        _report_update_check(update_check_enabled)
         return 0
 
     try:
@@ -565,6 +688,7 @@ def main(argv=None) -> int:
             save_config(config_path, updated)
         elif new_text == text:
             print("\nConfig already byte-identical — not rewritten.")
+            _report_update_check(update_check_enabled)
             return 0
         else:
             save_config_text(config_path, new_text, backup=True)
@@ -589,6 +713,7 @@ def main(argv=None) -> int:
             )
         else:
             print("recent[]: nothing to prune.")
+    _report_update_check(update_check_enabled)
     return 0
 
 
