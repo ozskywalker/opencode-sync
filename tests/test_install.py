@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import os
 import stat
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
 from opencode_sync.cli import _find_opencode_bin, main
+
+IS_WINDOWS = sys.platform == "win32"
 
 
 # ---------------------------------------------------------------------------
@@ -39,7 +42,7 @@ class TestFindOpencodeBin:
         real = real_dir / "opencode"
         real.write_text("#!/bin/sh\nexec real\n")
 
-        path = f"{wrapper_dir}:{real_dir}"
+        path = os.pathsep.join([str(wrapper_dir), str(real_dir)])
         with patch.dict(os.environ, {"PATH": path}):
             result = _find_opencode_bin(wrapper)
         assert result == real
@@ -80,8 +83,13 @@ class TestInstall:
 
     def test_wrapper_is_executable(self, tmp_path):
         _, wrapper, _ = self._run(tmp_path)
-        mode = wrapper.stat().st_mode
-        assert mode & stat.S_IXUSR
+        if IS_WINDOWS:
+            # chmod exec bits don't exist on Windows (st_mode is always ~0666);
+            # the /bin/sh wrapper is only meaningful on POSIX systems anyway.
+            assert not (wrapper.stat().st_mode & stat.S_IXUSR)
+        else:
+            mode = wrapper.stat().st_mode
+            assert mode & stat.S_IXUSR
 
     def test_wrapper_has_shebang(self, tmp_path):
         _, wrapper, _ = self._run(tmp_path)
@@ -134,7 +142,7 @@ class TestInstall:
         real_bin = real_dir / "opencode"
         real_bin.write_text("#!/bin/sh\n")
 
-        path = f"{wrapper.parent}:{real_dir}"
+        path = os.pathsep.join([str(wrapper.parent), str(real_dir)])
         with patch.dict(os.environ, {"PATH": path}):
             main(["install", "--wrapper", str(wrapper), "--opencode-bin", str(real_bin)])
 
@@ -149,7 +157,7 @@ class TestInstall:
         real_bin.write_text("#!/bin/sh\n")
 
         # real bin dir comes BEFORE wrapper dir in PATH
-        path = f"{real_dir}:{wrapper.parent}"
+        path = os.pathsep.join([str(real_dir), str(wrapper.parent)])
         with patch.dict(os.environ, {"PATH": path}):
             main(["install", "--wrapper", str(wrapper), "--opencode-bin", str(real_bin)])
 
