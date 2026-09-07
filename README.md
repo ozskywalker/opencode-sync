@@ -180,6 +180,7 @@ opencode-sync [--host HOST] [--port PORT] [--provider ID] [--config PATH]
               [--rename OLD=NEW] [--no-infer-renames] [--dry-run]
               [--no-url-update] [--no-model-update] [--timeout SECONDS]
               [--default-model MODE] [--default-small-model MODE] [--prune-recent]
+              [--json] [--quiet] [--verbose]
               [--version] [--no-update-check]
 ```
 
@@ -187,7 +188,7 @@ opencode-sync [--host HOST] [--port PORT] [--provider ID] [--config PATH]
 |---|---|---|
 | `--host HOST` | env, config, else localhost | vLLM server hostname |
 | `--port PORT` | env, config, else 8080 | vLLM server port |
-| `--provider ID` | all providers | Provider key to update |
+| `--provider ID` | all providers | Provider key to update. Naming a provider that isn't in the config is a hard error — so is naming one that has no stored `options.baseURL` (nothing to query; use `--host`/`--port` instead) |
 | `--config PATH` | auto-detect | Path to `opencode.jsonc` |
 | `--rename OLD=NEW` | — | Move a model entry to a new ID, keeping its settings (repeatable) |
 | `--no-infer-renames` | off | Don't treat a 1-in/1-out sync as a rename; drop the old entry |
@@ -196,14 +197,32 @@ opencode-sync [--host HOST] [--port PORT] [--provider ID] [--config PATH]
 | `--no-model-update` | off | Don't update `model`/`small_model` if the active model is removed |
 | `--default-model MODE` | `first` | Pointer policy: `first`, `none`, `auto`, or explicit `provider/model-id` |
 | `--default-small-model MODE` | `first` | Same, for `small_model` |
-| `--prune-recent` | off | Drop dead models from opencode's `recent[]` state file |
+| `--prune-recent` | off | Drop dead models from opencode's `recent[]` state file (also runs on no-op syncs, and `--dry-run` reports what *would* be pruned) |
 | `--timeout SECONDS` | 10 | HTTP request timeout |
+| `--json` | off | Print one machine-readable JSON result object on stdout instead of human output |
+| `--quiet` | off | Suppress progress output (including the banner); errors still go to stderr |
+| `--verbose` | off | Extra detail |
 | `--version` | — | Print `opencode-sync <version>` and exit |
 | `--no-update-check` | off | Skip the PyPI check for a newer release |
 
+### Exit codes
+
+The wrapper runs on every opencode launch, so scripts can rely on this contract:
+
+| Code | Meaning |
+|---|---|
+| `0` | Synced: the config was written (or `--dry-run` produced a plan) |
+| `2` | Nothing to do: model set unchanged, byte-identical render, or nothing to apply |
+| `1` | Error: invalid flags/provider, every server down, or the write failed |
+
+Per-provider failures on a multi-provider sync still warn and continue; exit `1`
+only when *every* provider failed. `--prune-recent` runs on no-op syncs too, so
+exit `2` can still coincide with state-file pruning.
+
 ## Version banner and update checks
 
-Every invocation prints its version as the first line of stdout:
+Every invocation prints its version as the first line of stdout (`--json` and
+`--quiet` suppress it, so stdout stays machine-readable or silent):
 
 ```
 opencode-sync v0.5.0
@@ -239,6 +258,6 @@ Override with `--config PATH`.
 
 ```bash
 pip install -e ".[dev]"
-python -m pytest                      # ~298 tests
+python -m pytest                      # ~340 tests
 python -m pytest --cov=opencode_sync  # with coverage
 ```

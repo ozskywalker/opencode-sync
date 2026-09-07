@@ -24,6 +24,7 @@
             "top_k": 20
           }
         }
+        // raise context when node-a1b2 gets more VRAM
       }
     },
     "node-c3d4": {

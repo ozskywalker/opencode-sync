@@ -56,6 +56,7 @@ class ObjectBody:
     span: Span            # the whole {...}
     members: List[Member]
     block_leading: Span   # between '{' and the first member's line
+    body_trailing: Span   # between the last member's trailing zone and the closing '}'
 
 
 @dataclass(frozen=True)
@@ -312,10 +313,28 @@ def find_object_members(masked: str, obj_span: Span) -> ObjectBody:
         block_leading = (
             Span(body_start, line_start) if line_start > body_start else Span(body_start, body_start)
         )
+        # Comments between the last member's trailing zone and the closing '}'
+        # belong to no member: they describe the object itself ("bump these
+        # limits when VRAM allows").  The last member's trailing span stops at
+        # the first newline after its value, so without a dedicated span this
+        # zone would be silently dropped on rebuild.  The block runs from that
+        # newline up to the closing brace's line start: the brace's own
+        # indentation is re-emitted by render_object (as ``base``), so it must
+        # not be part of the block.
+        last_comma = raw[-1][4]
+        trailing_end = last_comma + 1 if last_comma is not None else raw[-1][3]
+        after_last_nl = s.find("\n", trailing_end, end)
+        if after_last_nl == -1:
+            body_trailing = Span(end, end)
+        else:
+            body_trailing = Span(after_last_nl, _line_start(s, end))
     else:
         block_leading = Span(obj_span.start + 1, obj_span.start + 1)
+        body_trailing = Span(obj_span.start + 1, obj_span.start + 1)
 
-    return ObjectBody(span=obj_span, members=members, block_leading=block_leading)
+    return ObjectBody(
+        span=obj_span, members=members, block_leading=block_leading, body_trailing=body_trailing
+    )
 
 
 def find_root_span(masked: str) -> Span:
@@ -364,8 +383,19 @@ def detect_unit(text: str, base: str, member_start: Optional[int]) -> str:
     return indent[len(base) :]
 
 
-def render_object(base: str, unit: str, block_leading: str, entries: List[RenderEntry]) -> str:
-    """Rebuild an object body, re-emitting comments verbatim."""
+def render_object(
+    base: str,
+    unit: str,
+    block_leading: str,
+    entries: List[RenderEntry],
+    body_trailing: str = "",
+) -> str:
+    """Rebuild an object body, re-emitting comments verbatim.
+
+    ``body_trailing`` carries the comments (and whitespace) that sat between the
+    last member and the closing brace; it is re-emitted verbatim so a rebuild
+    cannot silently drop them.
+    """
     if not entries:
         return "{}"
     out = ["{", block_leading]
@@ -376,7 +406,23 @@ def render_object(base: str, unit: str, block_leading: str, entries: List[Render
         if idx != last:
             out.append(",")
         out.append(entry.trailing)
+        # A comment-bearing body_trailing starts with the newline that ends
+        # the last member's line; let it own that newline instead of doubling it.
+        if idx == last and body_trailing and body_trailing.strip():
+            continue
         out.append("\n")
+    # Comments (and whitespace) that sat between the last member and the
+    # closing brace.  Pure-whitespace blocks are dropped: the entry loop above
+    # already emits the separating newline, and re-emitting an empty block's
+    # newline would open a blank line ahead of the brace.  Comment-bearing
+    # blocks are re-emitted verbatim, followed by a fresh newline, so the
+    # brace lands on its own properly indented line.
+    if body_trailing and body_trailing.strip():
+        if not body_trailing.startswith("\n"):
+            out.append("\n")
+        out.append(body_trailing)
+        if not body_trailing.endswith("\n"):
+            out.append("\n")
     out.append(base + "}")
     return "".join(out)
 

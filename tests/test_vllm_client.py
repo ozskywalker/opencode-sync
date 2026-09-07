@@ -50,13 +50,11 @@ class TestModelInfo:
         assert m.object == "model"
         assert m.owned_by == ""
 
-    def test_from_dict_extra_fields_captured(self):
-        m = ModelInfo.from_dict({"id": "x", "created": 123})
-        assert m.extra == {"created": 123}
-
-    def test_from_dict_extra_excludes_known_fields(self):
-        m = ModelInfo.from_dict({"id": "x", "object": "model", "owned_by": "y"})
-        assert m.extra == {}
+    def test_unknown_fields_are_ignored(self):
+        # The config's model list is keyed on id alone; extra listing fields
+        # (created, permission, ...) are not carried around.
+        m = ModelInfo.from_dict({"id": "x", "created": 123, "permission": []})
+        assert m.id == "x"
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +133,37 @@ class TestGetModels:
         client = make_client(error=VLLMParseError("bad json"))
         with pytest.raises(VLLMParseError, match="bad json"):
             client.get_models()
+
+
+# ---------------------------------------------------------------------------
+# _stdlib_http_get: non-UTF-8 response body
+# ---------------------------------------------------------------------------
+
+class TestStdlibHttpGetEncoding:
+    def test_non_utf8_body_becomes_parse_error(self):
+        # S8: a server replying with e.g. latin-1 bytes used to escape as a raw
+        # UnicodeDecodeError, outside the CLI's VLLMClientError handling.
+        from opencode_sync.vllm_client import _stdlib_http_get
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return b'{"id": "caf\xe9"}'  # \xe9 is not valid UTF-8
+
+        import urllib.request
+
+        orig = urllib.request.urlopen
+        urllib.request.urlopen = lambda *a, **k: FakeResponse()
+        try:
+            with pytest.raises(VLLMParseError, match="not valid UTF-8"):
+                _stdlib_http_get("http://x/v1/models", 5)
+        finally:
+            urllib.request.urlopen = orig
 
 
 # ---------------------------------------------------------------------------

@@ -11,7 +11,6 @@ from unittest.mock import patch
 import pytest
 
 from opencode_sync.config import (
-    _strip_jsonc_comments,
     apply_plan,
     find_config_path,
     find_provider_by_url,
@@ -22,71 +21,13 @@ from opencode_sync.config import (
     prune_recent_models,
     save_config,
     state_model_json_path,
-    update_provider_models,
 )
 from tests.conftest import SAMPLE_CONFIG, SAMPLE_JSONC
 
 
 # ---------------------------------------------------------------------------
-# JSONC comment stripping
+# parse_jsonc
 # ---------------------------------------------------------------------------
-
-class TestStripJsoncComments:
-    def test_single_line_comment_removed(self):
-        text = '{"a": 1} // this is a comment\n'
-        result = _strip_jsonc_comments(text)
-        assert "//" not in result
-        assert "this is a comment" not in result
-
-    def test_block_comment_removed(self):
-        text = '{"a": /* block comment */ 1}'
-        result = _strip_jsonc_comments(text)
-        assert "block comment" not in result
-        assert "/*" not in result
-
-    def test_url_in_string_preserved(self):
-        text = '{"url": "http://example.com:8000/v1"}'
-        result = _strip_jsonc_comments(text)
-        assert "http://example.com:8000/v1" in result
-
-    def test_double_slash_in_string_preserved(self):
-        text = '{"key": "value // not a comment"}'
-        result = _strip_jsonc_comments(text)
-        assert "// not a comment" in result
-
-    def test_escaped_quote_in_string(self):
-        text = r'{"key": "he said \"hello\""}'
-        result = _strip_jsonc_comments(text)
-        assert r'\"hello\"' in result
-
-    def test_comment_on_own_line(self):
-        text = '{\n  // standalone comment\n  "a": 1\n}'
-        result = _strip_jsonc_comments(text)
-        assert "standalone comment" not in result
-        assert '"a": 1' in result
-
-    def test_multiple_comments(self):
-        text = '{"a": 1} // c1\n// c2\n{"b": 2}'
-        result = _strip_jsonc_comments(text)
-        assert "c1" not in result and "c2" not in result
-
-    def test_block_comment_spanning_lines(self):
-        text = '{"a":\n/* line1\nline2 */\n1}'
-        result = _strip_jsonc_comments(text)
-        assert "line1" not in result
-        assert "line2" not in result
-
-    def test_empty_string(self):
-        assert _strip_jsonc_comments("") == ""
-
-    def test_no_comments_unchanged(self):
-        text = '{"key": "value", "n": 42}'
-        assert _strip_jsonc_comments(text) == text
-
-    def test_unterminated_block_comment_does_not_crash(self):
-        text = '{"a": 1 /* unterminated'
-        # Should not raise; consumes to EOF
-        _strip_jsonc_comments(text)
 
 
 class TestTrailingCommas:
@@ -337,114 +278,56 @@ class TestFindProviderByUrl:
 # ---------------------------------------------------------------------------
 
 class TestUpdateProviderModels:
+    """Plan/apply-pair invariants that were once covered via the removed
+    update_provider_models facade.  The facade itself is gone: it bypassed the
+    surgical editor (it would have destroyed comments if ever wired into the
+    CLI) and hard-coded infer_renames=False, silently diverging from the CLI.
+    These tests keep the invariants it guarded, expressed on plan+apply.
+    """
+
     def _base(self):
         return copy.deepcopy(SAMPLE_CONFIG)
 
-    # -- added / removed reporting
+    def test_apply_plan_rebuilds_models_in_server_order(self):
+        plan = plan_provider_update(self._base(), "vllm", ["z-model", "a-model", "m-model"])
+        updated = apply_plan(self._base(), plan)
+        assert list(updated["provider"]["vllm"]["models"].keys()) == [
+            "z-model", "a-model", "m-model",
+        ]
 
-    def test_added_reported(self):
-        _, added, _ = update_provider_models(self._base(), "vllm", ["org/model-a", "org/model-c"])
-        assert added == ["org/model-c"]
-
-    def test_removed_reported(self):
-        _, _, removed = update_provider_models(self._base(), "vllm", ["org/model-a"])
-        assert removed == ["org/model-b"]
-
-    def test_no_changes(self):
-        _, added, removed = update_provider_models(
-            self._base(), "vllm", ["org/model-a", "org/model-b"]
-        )
-        assert added == [] and removed == []
-
-    # -- model list updated
-
-    def test_models_dict_updated(self):
-        updated, _, _ = update_provider_models(self._base(), "vllm", ["org/model-c"])
+    def test_apply_plan_preserves_existing_display_names(self):
+        plan = plan_provider_update(self._base(), "vllm", ["org/model-a", "org/model-b"])
+        updated = apply_plan(self._base(), plan)
         models = updated["provider"]["vllm"]["models"]
-        assert list(models.keys()) == ["org/model-c"]
+        assert models["org/model-a"]["name"] == "Model A"
+        assert models["org/model-b"]["name"] == "Model B"
 
-    def test_model_order_preserved(self):
-        ids = ["z-model", "a-model", "m-model"]
-        updated, _, _ = update_provider_models(self._base(), "vllm", ids)
-        assert list(updated["provider"]["vllm"]["models"].keys()) == ids
-
-    # -- display name handling
-
-    def test_existing_display_name_preserved(self):
-        updated, _, _ = update_provider_models(
-            self._base(), "vllm", ["org/model-a", "org/model-b"]
-        )
-        assert updated["provider"]["vllm"]["models"]["org/model-a"]["name"] == "Model A"
-        assert updated["provider"]["vllm"]["models"]["org/model-b"]["name"] == "Model B"
-
-    def test_new_model_gets_generated_name(self):
-        updated, _, _ = update_provider_models(self._base(), "vllm", ["org/new-model"])
+    def test_apply_plan_generates_name_for_new_model(self):
+        plan = plan_provider_update(self._base(), "vllm", ["org/new-model"])
+        updated = apply_plan(self._base(), plan)
         assert updated["provider"]["vllm"]["models"]["org/new-model"]["name"] == "new-model"
 
-    # -- baseURL update
-
-    def test_base_url_updated_when_provided(self):
-        updated, _, _ = update_provider_models(
+    def test_apply_plan_sets_base_url_only_when_it_differs(self):
+        plan = plan_provider_update(
             self._base(), "vllm", ["org/model-a"], base_url="http://remote:9000/v1"
         )
+        assert plan.base_url == "http://remote:9000/v1"
+        updated = apply_plan(self._base(), plan)
         assert updated["provider"]["vllm"]["options"]["baseURL"] == "http://remote:9000/v1"
 
-    def test_base_url_not_touched_when_none(self):
-        updated, _, _ = update_provider_models(
-            self._base(), "vllm", ["org/model-a"], base_url=None
-        )
-        assert updated["provider"]["vllm"]["options"]["baseURL"] == "http://localhost:8080/v1"
+        same = plan_provider_update(self._base(), "vllm", ["org/model-a"])
+        assert same.base_url is None
 
-    # -- active model handling
-
-    def test_active_model_unchanged_when_still_valid(self):
-        # Already in provider-qualified form — left as-is
-        updated, _, _ = update_provider_models(
-            self._base(), "vllm", ["org/model-a", "org/model-b"]
-        )
-        assert updated["model"] == "vllm/org/model-a"
-        assert updated["small_model"] == "vllm/org/model-a"
-
-    def test_bare_model_id_normalized_to_qualified(self):
-        # Bare model ID (written by a previous sync) is normalized to provider-qualified form
-        config = copy.deepcopy(SAMPLE_CONFIG)
-        config["model"] = "org/model-a"
-        config["small_model"] = "org/model-a"
-        updated, _, _ = update_provider_models(config, "vllm", ["org/model-a", "org/model-b"])
-        assert updated["model"] == "vllm/org/model-a"
-        assert updated["small_model"] == "vllm/org/model-a"
-
-    def test_active_model_updated_when_removed(self):
-        updated, _, _ = update_provider_models(self._base(), "vllm", ["org/model-b"])
-        assert updated["model"] == "vllm/org/model-b"
-        assert updated["small_model"] == "vllm/org/model-b"
-
-    def test_active_model_not_updated_when_flag_false(self):
-        updated, _, _ = update_provider_models(
-            self._base(), "vllm", ["org/model-b"], update_active_model=False
-        )
-        assert updated["model"] == "vllm/org/model-a"  # unchanged even though removed
-
-    # -- provider creation
-
-    def test_creates_new_provider_if_missing(self):
-        config = {}
-        updated, _, _ = update_provider_models(config, "my-llm", ["some/model"])
-        assert "my-llm" in updated["provider"]
+    def test_apply_plan_creates_new_provider_if_missing(self):
+        plan = plan_provider_update({}, "my-llm", ["some/model"])
+        updated = apply_plan({}, plan)
         assert updated["provider"]["my-llm"]["npm"] == "@ai-sdk/openai-compatible"
 
-    def test_creates_provider_with_base_url(self):
-        updated, _, _ = update_provider_models(
-            {}, "my-llm", ["some/model"], base_url="http://host/v1"
-        )
-        assert updated["provider"]["my-llm"]["options"]["baseURL"] == "http://host/v1"
-
-    # -- original config not mutated
-
-    def test_original_config_not_mutated(self):
+    def test_plan_apply_does_not_mutate_input_config(self):
         config = self._base()
         original = copy.deepcopy(config)
-        update_provider_models(config, "vllm", ["org/model-c"])
+        plan = plan_provider_update(config, "vllm", ["org/model-c"])
+        apply_plan(config, plan)
         assert config == original
 
 
