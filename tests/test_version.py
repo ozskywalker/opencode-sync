@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import urllib.error
 
 import pytest
@@ -130,6 +131,60 @@ class TestBanner:
         out = capsys.readouterr().out
         assert _first_line(out) == _banner()
         assert "usage:" in out
+
+
+class TestConsoleEncodingGuard:
+    """A cp1252 console must never turn a finished sync into a UnicodeEncodeError."""
+
+    def test_streams_are_reconfigured_to_replace(self, monkeypatch):
+        seen = []
+
+        class FakeStream:
+            def reconfigure(self, **kwargs):
+                seen.append(kwargs)
+
+        fake_out, fake_err = FakeStream(), FakeStream()
+        monkeypatch.setattr(cli.sys, "stdout", fake_out)
+        monkeypatch.setattr(cli.sys, "stderr", fake_err)
+        cli._make_output_safe()
+        assert seen == [{"errors": "replace"}, {"errors": "replace"}]
+
+    def test_streams_without_reconfigure_are_tolerated(self, monkeypatch):
+        class Bare:
+            pass
+
+        monkeypatch.setattr(cli.sys, "stdout", Bare())
+        monkeypatch.setattr(cli.sys, "stderr", Bare())
+        cli._make_output_safe()  # must not raise
+
+    def test_reconfigure_failure_is_swallowed(self, monkeypatch):
+        class Fussy:
+            def reconfigure(self, **kwargs):
+                raise ValueError("not supported")
+
+        monkeypatch.setattr(cli.sys, "stdout", Fussy())
+        monkeypatch.setattr(cli.sys, "stderr", Fussy())
+        cli._make_output_safe()  # must not raise
+
+    def test_real_main_run_reconfigures_streams(self, tmp_path, mock_server, monkeypatch, capsys):
+        # End to end: whatever console the user has, main() must have made the
+        # streams replacement-tolerant before printing the banner.
+        cfg = tmp_path / "opencode.jsonc"
+        _write_single_provider_config(cfg, base_url=mock_server(["org/model-a"]).base_url)
+        monkeypatch.setattr(cli, "_check_pypi_update", lambda *a, **k: None)
+
+        reconfigured = []
+        orig_reconfigure = getattr(sys.stdout, "reconfigure", None)
+
+        def spy(**kwargs):
+            reconfigured.append(kwargs)
+            if orig_reconfigure is not None:
+                orig_reconfigure(**kwargs)
+
+        if hasattr(sys.stdout, "reconfigure"):
+            monkeypatch.setattr(sys.stdout, "reconfigure", spy)
+        main(["--config", str(cfg)])
+        assert reconfigured == [{"errors": "replace"}]
 
 
 # ---------------------------------------------------------------------------
@@ -442,7 +497,7 @@ class TestByteIdenticalPath:
         )
         monkeypatch.setattr(cli, "apply_plans_to_text", lambda text, config, plans: text)
         rc = main(["--config", str(cfg)])
-        assert rc == 0
+        assert rc == 2  # EXIT_NOTHING_TO_DO: rendered result is byte-identical
         assert cfg.read_text(encoding="utf-8") == original  # not rewritten
         out = capsys.readouterr().out
         assert "byte-identical" in out

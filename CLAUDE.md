@@ -6,28 +6,40 @@
 opencode_sync/
 ├── vllm_client.py   # HTTP client: queries GET /v1/models
 ├── jsonc_edit.py    # Position-preserving JSONC scanner + text splicing (pure text->text)
-├── config.py        # Config domain layer: parse, plan, surgical edit, atomic write
+├── io.py            # Config path discovery, verbatim reads, atomic writes, parse_jsonc
+├── planning.py      # Pure plan computation: plan_provider_update, apply_plan, ProviderPlan
+├── surgical.py      # Span-level text editing that preserves comments byte-for-byte
+├── state.py         # opencode model.json recent[] pruning
+├── config.py        # Facade re-exporting the domain API (io/planning/surgical/state)
 └── cli.py           # Argument parsing and orchestration (entry point)
 
 tests/
 ├── conftest.py      # MockVLLMServer (real threaded HTTPServer), shared fixtures
 ├── fixtures/
 │   └── advanced.jsonc   # Realistic hand-maintained config: comments, 2 providers,
-│                        # per-model tuning, agent section, trailing-space canaries
+│                        # per-model tuning, agent section, trailing-space canaries,
+│                        # a brace-adjacent ("orphan zone") comment canary
 ├── test_vllm_client.py
 ├── test_jsonc_edit.py   # The scanner, in isolation
-├── test_config.py
+├── test_config.py       # Domain-level unit tests (import via the config facade)
 ├── test_surgical.py     # Safety: what a sync must NOT disturb
+├── test_install.py
+├── test_version.py
 └── test_integration.py
 ```
+
+Import direction (must stay acyclic): `io` and `planning` depend only on
+`jsonc_edit`/stdlib; `surgical` adds `planning` + `io`; `state` adds `io`;
+`config` is a facade over all four; `cli` imports the domain API from
+`config`. Never make `planning` depend on `surgical` or the facade.
 
 ## Running tests
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-python -m pytest                         # 205 tests
-python -m pytest --cov=opencode_sync     # ~92% branch coverage
+python -m pytest                         # 341 tests
+python -m pytest --cov=opencode_sync     # ~93% branch coverage
 ```
 
 No external runtime dependencies. `pytest` and `pytest-cov` are dev-only.
@@ -72,7 +84,7 @@ Two independent guards stop a bad edit reaching disk, and **neither ever falls b
 If the model set is unchanged, no edit is produced and the file is not written at all — the wrapper runs on every opencode launch, so this is the common case.
 
 ### JSONC parsing
-`jsonc_edit.find_comment_spans` is a hand-rolled state machine that handles `//`, `/* */`, escaped quotes inside strings, and URLs (`://`) in string values. It does **not** use regex — regex cannot correctly track string context. There is **one** state machine with two consumers, so they can't drift: `mask_comments` blanks the spans (surgical path), `config._strip_jsonc_comments` deletes them.
+`jsonc_edit.find_comment_spans` is a hand-rolled state machine that handles `//`, `/* */`, escaped quotes inside strings, and URLs (`://`) in string values. It does **not** use regex — regex cannot correctly track string context. `mask_comments` blanks the spans (surgical path); `parse_jsonc` composes `mask_comments` + `mask_trailing_commas` before handing the masked text to `json.loads`, so both JSONC-tolerant paths flow through the same state machine and can't drift. (An old `_strip_jsonc_comments` delete-the-spans variant was removed: nothing in production consumed it.)
 
 `mask_trailing_commas` is also string-aware, for the same reason. It replaced a regex (`,(\s*[}\]])`) that silently corrupted data: `parse_jsonc('{"a": "x,  }"}')` used to return `{'a': 'x  }'}`. If you're tempted by a regex here, that's the bug you'll reintroduce.
 
@@ -100,19 +112,37 @@ The planner modes (`_plan_model_key_updates`):
 - `first` (default) — legacy: never invent a pointer, only repair one that already points at the synced provider. This is why a sync of a renamed server didn't used to change what opencode defaults to when no pointer existed.
 - `none` — never touch the keys.
 - `auto` — when this provider's model set actually changed, point the key at the first served model. No-op syncs don't churn the pointer (the wrapper runs on every launch).
-- explicit `provider/model-id` — written whenever it differs, change or no change. Validated against the syncing provider; a pointer naming another provider is rejected.
+- explicit `provider/model-id` — written whenever it differs, change or no change. Validated against the syncing provider; a pointer naming another provider is rejected *before any HTTP call* (`main()` pre-checks it against the resolved targets; the planner's ValueError is the belt, the CLI check is the braces).
 
 Cross-provider isolation applies in every mode. `update_active_model=False` (`--no-model-update`) still disables all pointer work.
 
 The surgical editor can now *insert* a top-level `model`/`small_model` key it has never seen (via `_append_member_edit`, which re-emits existing members from source text, so comments survive). It used to be rewrite-only because the planner never invented pointers.
 
-`--prune-recent` drops dead models from the state file's `recent[]` (path honors `XDG_STATE_HOME`; entries for providers this tool doesn't sync are kept — it only judges what it syncs). When the first entry is pruned and a pointer update exists, the pointed-at model is seeded at the head of `recent[]`.
+`--prune-recent` drops dead models from the state file's `recent[]` (path honors `XDG_STATE_HOME`; entries for providers this tool doesn't sync are kept — it only judges what it syncs). When the first entry is pruned and a pointer update exists, the pointed-at model is seeded at the head of `recent[]`. The prune runs **independent of the config-write outcome** — including no-op syncs, where a stale `recent[]` head would otherwise keep shadowing the default forever. Under `--dry-run` it reports what *would* be pruned without touching the state file (the no-op branch honors this too — it was once a real bug that only `--dry-run` after a non-noop plan was dry).
+
+### Explicit provider targeting is strict
+Naming a provider (`--provider ID`, with or without `--host`/`--port`) is an explicit request to update *that* provider, so both failure modes are hard errors rather than surprises:
+- a provider ID that isn't in the config dies (`not in the config (...)`) — the old behavior silently *created* a bogus provider block and exited 0, turning typos into config corruption;
+- a named provider with no stored `options.baseURL` dies (`no options.baseURL to query`) — the old behavior silently queried `http://localhost:8080/v1` and could sync a stranger's model list into the entry. The sync-all path (no `--provider`) still warns-and-skips such providers, since nothing was named.
+
+### Orphan-zone comments (`body_trailing`, don't regress this)
+A comment between the last member and an object's closing brace belongs to no member — it describes the object. `find_object_members` captures it as `ObjectBody.body_trailing` (span from the newline after the last member to the closing brace's line start), and `render_object` re-emits it verbatim before the brace. All three rebuild paths flow through this: the models rebuild, provider append, and top-level key append. Pure-whitespace trailing blocks are dropped on rebuild (the entry loop already emits the separator newline); comment-bearing blocks survive byte-identically. Canaries live in `test_surgical.py::TestCommentsSurvive` and the shared fixture.
+
+### EOL policy
+Inserted text is translated to the file's dominant line ending (`_dominant_eol` / `_to_file_eol` in `surgical.py`): a CRLF config stays uniformly CRLF after a rebuild instead of accumulating bare-LF lines. Producers (`render_object`, `_render_value`) emit `\n`-joined text; the surgical layer owns the translation so no producer needs to know.
+
+### Console encoding
+`main()` reconfigures stdout/stderr with `errors="replace"` before printing anything: a cp1252 console that can't render a glyph degrades the glyph, not the run. Printed output sticks to cp1252-representable characters (`->`, em-dashes are fine).
+
+### Exit codes
+`0` = synced (wrote, or `--dry-run` produced a plan); `2` = nothing to do (no-op, byte-identical, nothing to apply); `1` = error (validation, every server down, write failure). `--json` emits one JSON result object on stdout (banner and progress suppressed, update-check notice moved to stderr); `--quiet` suppresses progress but never errors; `--verbose` adds detail.
+
 
 ### Config mutation safety
-`apply_plan` always deep-copies the input dict before modifying it. The caller's dict is never mutated. Tests verify this in `TestUpdateProviderModels::test_original_config_not_mutated`.
+`apply_plan` always deep-copies the input dict before modifying it. The caller's dict is never mutated. Tests verify this in `TestUpdateProviderModels::test_plan_apply_does_not_mutate_input_config`.
 
 ### Writes are atomic
-`_atomic_write_text` writes a temp file in the target directory (same filesystem — `os.replace` is only atomic within one), fsyncs, copies the original's mode across (`mkstemp` creates 0600, so this is mandatory, not a nicety), then `os.replace`s. A rolling `.bak` is written **only when content actually changes**, so routine no-op runs don't churn it.
+`_atomic_write_text` writes a temp file in the target directory (same filesystem — `os.replace` is only atomic within one), fsyncs, copies the original's mode across (`mkstemp` creates 0600, so this is mandatory, not a nicety), then `os.replace`s. A rolling `.bak` is written **only when content actually changes**, so routine no-op runs don't churn it. The `install` wrapper uses the same temp+replace discipline (`_write_wrapper`), with the executable-bit chmod guarded to POSIX and `newline="\n"` so the `/bin/sh` wrapper can never be written with CRLF endings.
 
 Read and write both use `newline=""`. `Path.read_text`/`write_text` apply universal-newline translation, which silently converts a CRLF config to LF.
 

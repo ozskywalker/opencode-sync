@@ -5,18 +5,24 @@ from __future__ import annotations
 import json
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Callable, List, Optional
 
 DEFAULT_BASE_URL = "http://localhost:8080/v1"
 
 
 @dataclass
 class ModelInfo:
+    """One entry from GET /v1/models.
+
+    Only ``id`` drives behavior (the config's model list is keyed on it);
+    ``object``/``owned_by`` are parsed for callers that want them but nothing
+    in this tool reads them.
+    """
+
     id: str
     object: str = "model"
     owned_by: str = ""
-    extra: Dict = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: dict) -> "ModelInfo":
@@ -24,7 +30,6 @@ class ModelInfo:
             id=data["id"],
             object=data.get("object", "model"),
             owned_by=data.get("owned_by", ""),
-            extra={k: v for k, v in data.items() if k not in ("id", "object", "owned_by")},
         )
 
 
@@ -51,6 +56,11 @@ def _stdlib_http_get(url: str, timeout: int) -> dict:
         raise VLLMConnectionError(f"HTTP {e.code} from {url}: {e.reason}") from e
     except urllib.error.URLError as e:
         raise VLLMConnectionError(f"Cannot connect to {url}: {e.reason}") from e
+    except UnicodeDecodeError as e:
+        # A non-UTF-8 response body is a server-side problem the CLI can't fix;
+        # wrap it so the sync loop reports it like any other parse failure
+        # instead of letting a raw UnicodeDecodeError escape the handler.
+        raise VLLMParseError(f"Response from {url} is not valid UTF-8: {e}") from e
     except json.JSONDecodeError as e:
         raise VLLMParseError(f"Invalid JSON from {url}: {e}") from e
 

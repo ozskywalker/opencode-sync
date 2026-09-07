@@ -26,6 +26,7 @@ from opencode_sync.jsonc_edit import (
 
 FIXTURE = Path(__file__).parent / "fixtures" / "advanced.jsonc"
 COMMENT = 'Qwen3 "thinking" recommended sampling'
+ORPHAN_COMMENT = "raise context when node-a1b2 gets more VRAM"
 
 
 @pytest.fixture()
@@ -58,6 +59,10 @@ class TestFixtureIsRealistic:
 
     def test_carries_comments(self, text):
         assert text.count(COMMENT) == 2
+
+    def test_carries_an_orphan_zone_comment(self, text):
+        # A comment between the last model and the models closing brace.
+        assert text.count(ORPHAN_COMMENT) == 1
 
 
 class TestNoOpIsByteIdentical:
@@ -142,6 +147,107 @@ class TestCommentsSurvive:
         out = apply_plans_to_text(text, cfg, [plan])
         assert "// block-level note" in out
         assert "// about drop" not in out
+
+    # ------------------------------------------------------------------
+    # Orphan-zone canaries: a comment between the last member and the
+    # closing brace belongs to the object, not to any member.  Every path
+    # that rebuilds an object must re-emit it byte-identically.
+    # ------------------------------------------------------------------
+
+    ORPHAN_ZONE_TEXT = (
+        "{\n"
+        '  "provider": {\n'
+        '    "p": {\n'
+        '      "models": {\n'
+        '        "keep": { "name": "K" }\n'
+        "        // BUMP CONTEXT WHEN VRAM ALLOWS\n"
+        "      },\n"
+        '      "options": {\n'
+        '        "baseURL": "http://h:8000/v1"\n'
+        "      }\n"
+        "    }\n"
+        "  }\n"
+        "}\n"
+    )
+
+    def test_orphan_comment_survives_a_models_rebuild(self):
+        cfg = parse_jsonc(self.ORPHAN_ZONE_TEXT)
+        plan = plan_provider_update(cfg, "p", ["keep", "new/m"], infer_renames=False)
+        out = apply_plans_to_text(self.ORPHAN_ZONE_TEXT, cfg, [plan])
+        assert out.count("// BUMP CONTEXT WHEN VRAM ALLOWS") == 1
+        # It must still sit inside the models object, above its closing brace.
+        assert out.index("// BUMP CONTEXT WHEN VRAM ALLOWS") < out.index('"baseURL"')
+
+    def test_orphan_comment_survives_a_rename(self):
+        cfg = parse_jsonc(self.ORPHAN_ZONE_TEXT)
+        plan = plan_provider_update(cfg, "p", ["renamed"], renames={"keep": "renamed"})
+        out = apply_plans_to_text(self.ORPHAN_ZONE_TEXT, cfg, [plan])
+        assert out.count("// BUMP CONTEXT WHEN VRAM ALLOWS") == 1
+
+    def test_orphan_comment_survives_a_model_removal(self):
+        # Removing the only model leaves an empty models object; a comment
+        # that described the object has nothing to attach to, so dropping it
+        # is correct — the assert documents that deliberate behavior.
+        cfg = parse_jsonc(self.ORPHAN_ZONE_TEXT)
+        plan = plan_provider_update(cfg, "p", [], infer_renames=False)
+        out = apply_plans_to_text(self.ORPHAN_ZONE_TEXT, cfg, [plan])
+        assert parse_jsonc(out)["provider"]["p"]["models"] == {}
+
+    def test_orphan_comment_survives_a_provider_append(self):
+        text = (
+            "{\n"
+            '  "provider": {\n'
+            '    "p": {\n'
+            '      "models": {\n'
+            '        "keep": { "name": "K" }\n'
+            "        // note about p's models\n"
+            "      }\n"
+            "    }\n"
+            "  }\n"
+            "}\n"
+        )
+        cfg = parse_jsonc(text)
+        plan = plan_provider_update(cfg, "fresh", ["m1"], base_url="http://fresh:1/v1")
+        out = apply_plans_to_text(text, cfg, [plan])
+        assert "// note about p's models" in out
+        parsed = parse_jsonc(out)
+        assert parsed["provider"]["fresh"]["models"] == {"m1": {"name": "m1"}}
+
+    def test_orphan_comment_survives_a_top_level_key_append(self):
+        text = (
+            "{\n"
+            '  "provider": {\n'
+            '    "p": {\n'
+            '      "models": {\n'
+            '        "keep": { "name": "K" }\n'
+            "        // brace-adjacent note\n"
+            "      }\n"
+            "    }\n"
+            "  }\n"
+            "}\n"
+        )
+        cfg = parse_jsonc(text)
+        plan = plan_provider_update(cfg, "p", ["keep"], model_mode="explicit",
+                                    explicit_model="p/keep")
+        assert plan.model_key_updates == {"model": "p/keep"}
+        out = apply_plans_to_text(text, cfg, [plan])
+        assert "// brace-adjacent note" in out
+        assert parse_jsonc(out)["model"] == "p/keep"
+
+    def test_orphan_comment_in_the_root_object_survives(self):
+        text = (
+            "{\n"
+            '  "$schema": "https://opencode.ai/config.json"\n'
+            "  // root-level note\n"
+            "}\n"
+        )
+        cfg = parse_jsonc(text)
+        plan = plan_provider_update(cfg, "vllm", ["m1"], base_url="http://h:1/v1")
+        out = apply_plans_to_text(text, cfg, [plan])
+        assert "// root-level note" in out
+        parsed = parse_jsonc(out)
+        assert parsed["$schema"] == "https://opencode.ai/config.json"
+        assert parsed["provider"]["vllm"]["models"] == {"m1": {"name": "m1"}}
 
 
 class TestRename:
@@ -394,26 +500,26 @@ class TestSelfCheck:
     """Two independent guards, either of which must stop a bad edit reaching disk."""
 
     def test_an_edit_that_never_lands_is_refused(self, text, config, monkeypatch):
-        import opencode_sync.config as cfgmod
+        import opencode_sync.surgical as surgmod
 
         def sabotage(text_, masked, plan):
             span = find_value_span(masked, ["provider", plan.provider_id, "models"])
             return span, '{"wrong": {"name": "wrong"}}'
 
-        monkeypatch.setattr(cfgmod, "_models_edit", sabotage)
+        monkeypatch.setattr(surgmod, "_models_edit", sabotage)
         plan = plan_provider_update(config, "node-a1b2", ["aeon", "new/model-x"])
         with pytest.raises(JsoncEditError, match="did not converge"):
             apply_plans_to_text(text, config, [plan])
 
     def test_text_meaning_something_else_is_refused(self, config):
-        from opencode_sync.config import _verify_edit
+        from opencode_sync.surgical import _verify_edit
 
         plan = plan_provider_update(config, "node-a1b2", ["aeon"])
         with pytest.raises(JsoncEditError, match="changed the config's meaning"):
             _verify_edit('{"provider": {}}', config, [plan])
 
     def test_model_order_is_part_of_the_check(self, config):
-        from opencode_sync.config import _verify_edit
+        from opencode_sync.surgical import _verify_edit
 
         plan = plan_provider_update(config, "node-a1b2", ["a", "b"], infer_renames=False)
         good = {
@@ -435,7 +541,7 @@ class TestSelfCheck:
             _verify_edit(json.dumps(swapped), config, [plan])
 
     def test_invalid_output_is_refused(self, config):
-        from opencode_sync.config import _verify_edit
+        from opencode_sync.surgical import _verify_edit
 
         plan = plan_provider_update(config, "node-a1b2", ["aeon"])
         with pytest.raises(JsoncEditError, match="invalid JSONC"):
@@ -451,6 +557,61 @@ class TestIdempotence:
         plan2 = plan_provider_update(cfg2, "node-c3d4", ["qwen3.5-122B-A10B"])
         assert plan2.is_noop()
         assert apply_plans_to_text(once, cfg2, [plan2]) == once
+
+
+class TestEndOfLineUniformity:
+    """C5: inserted text must carry the file's line-ending convention."""
+
+    CRLF_TEXT = (
+        "{\r\n"
+        '  "provider": {\r\n'
+        '    "p": {\r\n'
+        '      "models": {\r\n'
+        '        "a": { "name": "A" }\r\n'
+        "      }\r\n"
+        "    }\r\n"
+        "  }\r\n"
+        "}\r\n"
+    )
+
+    def _sync(self, text):
+        cfg = parse_jsonc(text)
+        plan = plan_provider_update(cfg, "p", ["a", "new/m"], infer_renames=False)
+        return apply_plans_to_text(text, cfg, [plan])
+
+    def test_crlf_file_stays_crlf(self):
+        out = self._sync(self.CRLF_TEXT)
+        assert out.count("\r\n") == out.count("\n")
+        assert parse_jsonc(out)["provider"]["p"]["models"]["new/m"]["name"] == "m"
+
+    def test_lf_file_stays_lf(self):
+        text = self.CRLF_TEXT.replace("\r\n", "\n")
+        out = self._sync(text)
+        assert "\r" not in out
+
+    def test_noop_crlf_sync_is_byte_identical(self):
+        cfg = parse_jsonc(self.CRLF_TEXT)
+        plan = plan_provider_update(cfg, "p", ["a"])
+        assert apply_plans_to_text(self.CRLF_TEXT, cfg, [plan]) == self.CRLF_TEXT
+
+    def test_crlf_rename_never_produces_double_cr(self):
+        # Regression: a rebuild re-splices surviving entries from source text,
+        # so the replacement already contains CRLFs. Translating those again
+        # used to write "\r\r\n" into the file.
+        cfg = parse_jsonc(self.CRLF_TEXT)
+        plan = plan_provider_update(cfg, "p", ["b"], renames={"a": "b"})
+        out = apply_plans_to_text(self.CRLF_TEXT, cfg, [plan])
+        assert "\r\r" not in out
+        assert out.count("\r\n") == out.count("\n")
+        # Renames regenerate the display name from the new ID.
+        assert parse_jsonc(out)["provider"]["p"]["models"]["b"]["name"] == "b"
+
+    def test_crlf_noop_with_tuned_entry_never_produces_double_cr(self):
+        # Same hazard on a no-op-that-renders: entries re-spliced verbatim.
+        cfg = parse_jsonc(self.CRLF_TEXT)
+        plan = plan_provider_update(cfg, "p", ["a"])
+        out = apply_plans_to_text(self.CRLF_TEXT, cfg, [plan])
+        assert "\r\r" not in out
 
 
 class TestWholeFileProperty:
@@ -521,7 +682,8 @@ class TestEndToEnd:
         before = path.read_text()
         mtime = path.stat().st_mtime_ns
 
-        assert main(["--config", str(path), "--provider", "node-a1b2"]) == 0
+        # EXIT_NOTHING_TO_DO: the model set is unchanged, the file is untouched.
+        assert main(["--config", str(path), "--provider", "node-a1b2"]) == 2
         assert path.read_text() == before
         assert path.stat().st_mtime_ns == mtime
         assert not path.with_suffix(".jsonc.bak").exists()

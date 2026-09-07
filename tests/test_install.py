@@ -95,6 +95,18 @@ class TestInstall:
         _, wrapper, _ = self._run(tmp_path)
         assert wrapper.read_text().startswith("#!/bin/sh")
 
+    def test_wrapper_is_written_atomically(self, tmp_path):
+        # S6: temp file + os.replace, never a torn or partial wrapper.
+        _, wrapper, _ = self._run(tmp_path)
+        leftovers = [p.name for p in wrapper.parent.iterdir() if p.name != wrapper.name]
+        assert leftovers == []
+
+    def test_wrapper_uses_lf_endings_even_when_text_mode_is_crlf(self, tmp_path):
+        # The #!/bin/sh wrapper is meaningless if it carries CRLF endings;
+        # write with newline="\n" so the file stays POSIX-clean.
+        _, wrapper, _ = self._run(tmp_path)
+        assert "\r" not in wrapper.read_text(encoding="utf-8")
+
     def test_wrapper_contains_opencode_sync(self, tmp_path):
         _, wrapper, _ = self._run(tmp_path)
         assert "opencode-sync" in wrapper.read_text()

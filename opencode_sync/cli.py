@@ -6,8 +6,8 @@ import argparse
 import difflib
 import json
 import os
-import stat
 import sys
+import tempfile
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,6 +33,12 @@ from .vllm_client import DEFAULT_BASE_URL, VLLMClient, VLLMClientError
 DEFAULT_PORT = 8080
 LLAMA_HOST_ENV = "LLAMA_ARG_HOST"
 LLAMA_PORT_ENV = "LLAMA_ARG_PORT"
+
+# Exit-code contract (C2): the wrapper runs on every opencode launch, so a
+# consumer needs to tell "did work" from "nothing to do" from "broken".
+EXIT_SYNCED = 0        # a write happened (or would have, under --dry-run)
+EXIT_NOTHING_TO_DO = 2  # no-op sync, byte-identical, or nothing to apply
+EXIT_ERROR = 1         # validation failure, every server down, or write failure
 
 PYPI_PACKAGE_NAME = "opencode-sync"
 PYPI_JSON_URL = f"https://pypi.org/pypi/{PYPI_PACKAGE_NAME}/json"
@@ -66,6 +72,26 @@ def _get_version() -> str:
         from . import __version__
 
         return __version__
+
+
+def _make_output_safe() -> None:
+    """Never crash on console encoding.
+
+    Windows consoles default to cp1252/legacy code pages that cannot represent
+    every glyph we print (e.g. U+2192 RIGHTWARDS ARROW).  print() then raises
+    UnicodeEncodeError *after* the real work is done, turning a successful sync
+    into a traceback.  Reconfiguring the std streams to use the replacement
+    character degrades the glyph instead of the run.  No-op when the stream is
+    already tolerant or has no reconfigure hook (e.g. pytest capture).
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(errors="replace")
+        except (ValueError, OSError):
+            pass  # e.g. a wrapped/closed stream; printing is the caller's risk
 
 
 def _print_banner() -> None:
@@ -139,13 +165,15 @@ def _check_pypi_update(
     )
 
 
-def _report_update_check(enabled: bool) -> None:
+def _report_update_check(enabled: bool, json_mode: bool = False) -> None:
     if not enabled:
         return
     notice = _check_pypi_update()
     if notice:
-        print("\n---")
-        print(notice)
+        # Under --json the notice moves to stderr so stdout stays parseable.
+        target = sys.stderr if json_mode else sys.stdout
+        print("\n---", file=target)
+        print(notice, file=target)
 
 
 def _find_opencode_bin(wrapper_path: Path) -> Optional[Path]:
@@ -319,6 +347,24 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="SECONDS",
         help="HTTP request timeout in seconds (default: 10)",
     )
+    p.add_argument(
+        "--json",
+        action="store_true",
+        help=(
+            "Print a machine-readable JSON result object on stdout instead of "
+            "human output (banner suppressed; exit codes unchanged)"
+        ),
+    )
+    p.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress progress output; errors and warnings still go to stderr",
+    )
+    p.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print extra detail (target resolution, config path echo)",
+    )
     return p
 
 
@@ -358,6 +404,27 @@ def _resolve_pointer_flags(args) -> Tuple[str, str, Optional[str], Optional[str]
     return model_mode, small_mode, explicit_model, explicit_small
 
 
+def _write_wrapper(path: Path, content: str) -> None:
+    """Write the wrapper script atomically, with POSIX only making it executable.
+
+    os.replace keeps readers from seeing a torn file (same contract as the
+    config writer).  The chmod-x is skipped on Windows: the exec bits don't
+    exist there, and the /bin/sh wrapper is only meaningful on POSIX anyway.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=".opencode-sync-", suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(content)
+        if os.name == "posix":
+            os.chmod(tmp_name, 0o755)
+        os.replace(tmp_name, str(path))
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 def _cmd_install(args) -> int:
     wrapper_path: Path = args.wrapper or _DEFAULT_WRAPPER
 
@@ -383,12 +450,10 @@ def _cmd_install(args) -> int:
         _report_update_check(not args.no_update_check)
         return 1
 
-    wrapper_path.parent.mkdir(parents=True, exist_ok=True)
-    wrapper_path.write_text(content, encoding="utf-8")
-    wrapper_path.chmod(wrapper_path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    _write_wrapper(wrapper_path, content)
 
     print(f"Wrapper written: {wrapper_path}")
-    print(f"  → runs opencode-sync, then exec {opencode_bin}")
+    print(f"  -> runs opencode-sync, then exec {opencode_bin}")
 
     # Warn if the wrapper directory isn't on PATH before the real binary
     path_dirs = os.environ.get("PATH", "").split(os.pathsep)
@@ -460,6 +525,12 @@ def _resolve_targets(args, config: dict, target_specified: bool, host: str, port
     single-provider semantics.  With neither, every provider that has a stored
     baseURL is synced against its own URL — which is what makes the bare wrapper
     invocation useful on a multi-provider config.
+
+    Naming a provider is an explicit request to update *that* provider, so
+    errors there are hard: a provider ID that isn't in the config is a typo
+    (creating a bogus block silently would be worse), and a provider with no
+    stored baseURL has nowhere to query (falling back to a default server
+    would sync a stranger's model list into it).
     """
     providers = config.get("provider", {})
 
@@ -481,10 +552,28 @@ def _resolve_targets(args, config: dict, target_specified: bool, host: str, port
                         f"Multiple providers found ({', '.join(providers)}). "
                         "Use --provider to specify which one to update."
                     )
+        elif providers and provider_id not in providers:
+            # Same typo guard as the --provider-only path below.
+            _die(
+                f"Provider '{provider_id}' is not in the config "
+                f"({', '.join(providers)})."
+            )
         return [Target(provider_id, url, None if args.no_url_update else url)]
 
     if args.provider_id is not None:
-        url = query_url_for(args.provider_id) or DEFAULT_BASE_URL
+        # An explicitly named provider must exist: creating it here would turn
+        # a typo into a bogus provider block written with exit code 0.
+        if providers and args.provider_id not in providers:
+            _die(
+                f"Provider '{args.provider_id}' is not in the config "
+                f"({', '.join(providers)})."
+            )
+        url = query_url_for(args.provider_id)
+        if not url:
+            _die(
+                f"Provider '{args.provider_id}' has no options.baseURL to query. "
+                "Add one to the config, or use --host/--port."
+            )
         return [Target(args.provider_id, url, None)]
 
     if not providers:
@@ -508,14 +597,16 @@ def _resolve_targets(args, config: dict, target_specified: bool, host: str, port
 
 def _sync_one(args, config: dict, target: Target, renames: Dict[str, str], single: bool,
               model_mode: str = "first", small_model_mode: str = "first",
-              explicit_model: Optional[str] = None, explicit_small_model: Optional[str] = None):
+              explicit_model: Optional[str] = None, explicit_small_model: Optional[str] = None,
+              info=print):
     """Query one server and plan its update.
 
     Returns (plan, failed).  A plan of None means "nothing to do"; failed says
     whether that was because the server was unreachable, which is the only case
-    that should colour the exit code.
+    that should colour the exit code.  ``info`` prints human progress (a no-op
+    under --quiet); errors always go to stderr.
     """
-    print(f"Querying {target.query_base_url}/models for '{target.provider_id}' ...")
+    info(f"Querying {target.query_base_url}/models for '{target.provider_id}' ...")
     client = VLLMClient(base_url=target.query_base_url, timeout=args.timeout)
     try:
         model_ids = client.get_model_ids()
@@ -536,7 +627,7 @@ def _sync_one(args, config: dict, target: Target, renames: Dict[str, str], singl
         )
         return None, False
 
-    print(f"  Server reports {len(model_ids)} model(s): {', '.join(model_ids)}")
+    info(f"  Server reports {len(model_ids)} model(s): {', '.join(model_ids)}")
 
     plan = plan_provider_update(
         config=config,
@@ -552,38 +643,121 @@ def _sync_one(args, config: dict, target: Target, renames: Dict[str, str], singl
         explicit_model=explicit_model,
         explicit_small_model=explicit_small_model,
     )
-    _report(plan, config)
+    _report(plan, config, info=info)
     return plan, False
 
 
-def _report(plan: ProviderPlan, config: dict) -> None:
+def _report(plan: ProviderPlan, config: dict, info=print) -> None:
     existing = config.get("provider", {}).get(plan.provider_id, {}).get("models", {})
     for old, new in plan.renames.items():
         kept = sorted(set(existing.get(old, {})) - {"name"})
         detail = f" (kept {', '.join(kept)})" if kept else ""
-        print(f"  ~ Renamed: {old} -> {new}{detail}")
+        info(f"  ~ Renamed: {old} -> {new}{detail}")
     if plan.added:
-        print(f"  + Added:   {', '.join(plan.added)}")
+        info(f"  + Added:   {', '.join(plan.added)}")
     if plan.removed:
-        print(f"  - Removed: {', '.join(plan.removed)}")
+        info(f"  - Removed: {', '.join(plan.removed)}")
     if not (plan.added or plan.removed or plan.renames):
-        print("  Model list unchanged.")
+        info("  Model list unchanged.")
     if plan.base_url is not None:
-        print(f"  baseURL -> {plan.base_url!r}")
+        info(f"  baseURL -> {plan.base_url!r}")
     for key, value in plan.model_key_updates.items():
-        print(f"  {key}: {config.get(key)!r} -> {value!r}")
+        info(f"  {key}: {config.get(key)!r} -> {value!r}")
+
+
+def _run_prune(plans, config: dict, dry_run: bool, info=print) -> List[Tuple[str, str]]:
+    """Judge and report the recent[] state file against the post-sync config.
+
+    Runs regardless of whether the config itself needed a write: stale
+    recent[] entries matter on every launch, not just on write runs.  Under
+    dry-run it reports what would be pruned without touching the file.
+    Returns the removed (providerID, modelID) pairs.
+    """
+    # The planned config defines what "live" means.
+    final = config
+    for plan in plans:
+        final = apply_plan(final, plan)
+    removed = prune_recent_models(
+        live_providers=final.get("provider", {}),
+        model_key_updates=final_model_key_updates(plans),
+        dry_run=dry_run,
+    )
+    if removed:
+        prefix = "[dry-run] Would prune from recent[]: " if dry_run else "Pruned from recent[]: "
+        info(prefix + ", ".join(f"{pid}/{mid}" for pid, mid in removed))
+    else:
+        info("recent[]: nothing to prune.")
+    return removed
+
+
+@dataclass
+class _RunResult:
+    """What one sync run did — the payload for --json and the exit-code source."""
+
+    outcome: str                    # "synced" | "nothing-to-do" | "error"
+    config_path: Optional[str] = None
+    dry_run: bool = False
+    providers: Optional[List[dict]] = None
+    pruned: Optional[List[Tuple[str, str]]] = None
+    error: Optional[str] = None
+
+    def exit_code(self) -> int:
+        if self.outcome == "error":
+            return EXIT_ERROR
+        if self.outcome == "nothing-to-do":
+            return EXIT_NOTHING_TO_DO
+        return EXIT_SYNCED
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {
+                "result": self.outcome,
+                "exit_code": self.exit_code(),
+                "dry_run": self.dry_run,
+                "config": self.config_path,
+                "providers": self.providers or [],
+                "pruned_recent": self.pruned or [],
+                "error": self.error,
+            },
+            indent=2,
+        )
+
+
+def _finish(result: _RunResult, json_mode: bool) -> int:
+    """Single exit funnel: prints the JSON payload when requested, returns the code."""
+    if json_mode:
+        print(result.to_json())
+    return result.exit_code()
 
 
 def main(argv=None) -> int:
-    _print_banner()
+    _make_output_safe()
     parser = _build_parser()
+    # Banner precedes everything, including --help; --json and --quiet
+    # suppress it so stdout stays machine-readable (or silent).
+    argv_list = argv if argv is not None else sys.argv[1:]
+    if "--json" not in argv_list and "--quiet" not in argv_list:
+        _print_banner()
     args = parser.parse_args(argv)
+    json_mode = getattr(args, "json", False)
+    quiet = getattr(args, "quiet", False)
+    verbose = getattr(args, "verbose", False)
     update_check_enabled = not args.no_update_check
 
     if args.subcommand == "install":
         return _cmd_install(args)
 
+    def info(msg: str) -> None:
+        # Under --json, stdout carries only the final payload.
+        if not quiet and not json_mode:
+            print(msg)
+
+    def detail(msg: str) -> None:
+        if verbose and not json_mode:
+            print(msg)
+
     config_path = _resolve_config_path(args.config)
+    detail(f"Config path: {config_path}")
     renames = _parse_renames(args.rename)
     model_mode, small_model_mode, explicit_model, explicit_small_model = (
         _resolve_pointer_flags(args))
@@ -601,20 +775,22 @@ def main(argv=None) -> int:
         if args.port is not None
         else (env_port if env_port is not None else DEFAULT_PORT)
     )
+    detail(f"Sync target: {'--host/--port ' + target_host + ':' + str(target_port)}"
+           if target_specified else "Sync target: each provider's stored baseURL")
 
     # ------------------------------------------------------------------ #
     # Load existing config (or start fresh)
     # ------------------------------------------------------------------ #
     text: Optional[str] = None
     if config_path.exists():
-        print(f"Loading config: {config_path}")
+        info(f"Loading config: {config_path}")
         try:
             text = load_config_text(config_path)
             config = load_config(config_path)
         except Exception as e:
             _die(f"Failed to parse config: {e}")
     else:
-        print(f"Config not found — will create: {config_path}")
+        info(f"Config not found — will create: {config_path}")
         config = {}
 
     targets = _resolve_targets(args, config, target_specified, target_host, target_port)
@@ -623,11 +799,33 @@ def main(argv=None) -> int:
     if renames and not single:
         _die("--rename needs a single provider. Use --provider to pick one.")
 
+    # An explicit pointer naming a provider we are not syncing is rejected
+    # here, before any server is queried.  The planner enforces the same rule
+    # per-plan (a ValueError per mismatched provider), so a multi-provider
+    # sync-all with a pointer at just one of them also dies here, not mid-loop
+    # with a traceback after the HTTP round-trip.
+    def _check_pointer(flag: str, value: Optional[str]) -> None:
+        if value is None:
+            return
+        head = value.partition("/")[0]
+        mismatched = [t.provider_id for t in targets if t.provider_id != head]
+        if mismatched:
+            _die(
+                f"{flag} {value!r} names provider {head!r}, but this sync also "
+                f"covers {', '.join(mismatched)}; a pointer may only name a "
+                f"provider when the sync targets exactly that provider "
+                f"(use --provider)."
+            )
+
+    _check_pointer("--default-model", explicit_model)
+    _check_pointer("--default-small-model", explicit_small_model)
+
     # ------------------------------------------------------------------ #
     # Query each server and plan its changes
     # ------------------------------------------------------------------ #
     plans = []
     failures = 0
+    provider_results: List[dict] = []
     for target in targets:
         plan, failed = _sync_one(
             args, config, target, renames, single,
@@ -635,23 +833,49 @@ def main(argv=None) -> int:
             small_model_mode=small_model_mode,
             explicit_model=explicit_model,
             explicit_small_model=explicit_small_model,
+            info=info,
         )
         failures += bool(failed)
         if plan is not None:
             plans.append(plan)
+            provider_results.append({
+                "provider": plan.provider_id,
+                "added": plan.added,
+                "removed": plan.removed,
+                "renames": plan.renames,
+                "base_url": plan.base_url,
+                "model_key_updates": plan.model_key_updates,
+            })
+
+    result = _RunResult(
+        outcome="synced",
+        config_path=str(config_path),
+        dry_run=bool(args.dry_run),
+        providers=provider_results,
+    )
 
     if not plans:
         if failures:
             print("Nothing synced.", file=sys.stderr)
-            _report_update_check(update_check_enabled)
-            return 1
-        _report_update_check(update_check_enabled)
-        return 0  # servers were reachable, there was just nothing to apply
+            result.outcome = "error"
+            result.error = "every provider failed"
+            _report_update_check(update_check_enabled, json_mode)
+            return _finish(result, json_mode)
+        result.outcome = "nothing-to-do"
+        result.error = "servers reachable but nothing to apply"
+        _report_update_check(update_check_enabled, json_mode)
+        return _finish(result, json_mode)
 
     if all(plan.is_noop() for plan in plans):
-        print("\nConfig already up to date.")
-        _report_update_check(update_check_enabled)
-        return 0
+        info("\nConfig already up to date.")
+        result.outcome = "nothing-to-do"
+        if args.prune_recent:
+            # Stale recent[] entries shadow the default on every launch, so
+            # pruning is worth doing (and reporting) even when the config
+            # itself needed no write.  --dry-run still reports only.
+            result.pruned = _run_prune(plans, config, dry_run=args.dry_run, info=info)
+        _report_update_check(update_check_enabled, json_mode)
+        return _finish(result, json_mode)
 
     # ------------------------------------------------------------------ #
     # Render the new config text
@@ -671,7 +895,7 @@ def main(argv=None) -> int:
     # Write (unless --dry-run)
     # ------------------------------------------------------------------ #
     if args.dry_run:
-        if new_text is not None:
+        if new_text is not None and not json_mode:
             diff = difflib.unified_diff(
                 text.splitlines(keepends=True),
                 new_text.splitlines(keepends=True),
@@ -679,42 +903,33 @@ def main(argv=None) -> int:
                 tofile=f"{config_path} (planned)",
             )
             sys.stdout.writelines(diff)
-        print("\n[dry-run] Config not written.")
-        _report_update_check(update_check_enabled)
-        return 0
+        info("\n[dry-run] Config not written.")
+        if args.prune_recent:
+            result.pruned = _run_prune(plans, config, dry_run=True, info=info)
+        _report_update_check(update_check_enabled, json_mode)
+        return _finish(result, json_mode)
 
     try:
         if new_text is None:
             save_config(config_path, updated)
         elif new_text == text:
-            print("\nConfig already byte-identical — not rewritten.")
-            _report_update_check(update_check_enabled)
-            return 0
+            info("\nConfig already byte-identical — not rewritten.")
+            result.outcome = "nothing-to-do"
+            if args.prune_recent:
+                result.pruned = _run_prune(plans, config, dry_run=False, info=info)
+            _report_update_check(update_check_enabled, json_mode)
+            return _finish(result, json_mode)
         else:
             save_config_text(config_path, new_text, backup=True)
     except Exception as e:
         _die(f"Failed to write config: {e}")
 
-    print(f"\nConfig saved: {config_path}")
+    info(f"\nConfig saved: {config_path}")
 
     if args.prune_recent:
-        # The freshly written config defines what "live" means.
-        final = config
-        for plan in plans:
-            final = apply_plan(final, plan)
-        removed = prune_recent_models(
-            live_providers=final.get("provider", {}),
-            model_key_updates=final_model_key_updates(plans),
-        )
-        if removed:
-            print(
-                "Pruned from recent[]: "
-                + ", ".join(f"{pid}/{mid}" for pid, mid in removed)
-            )
-        else:
-            print("recent[]: nothing to prune.")
-    _report_update_check(update_check_enabled)
-    return 0
+        result.pruned = _run_prune(plans, config, dry_run=False, info=info)
+    _report_update_check(update_check_enabled, json_mode)
+    return _finish(result, json_mode)
 
 
 def final_model_key_updates(plans: List[ProviderPlan]) -> Dict[str, str]:

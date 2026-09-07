@@ -13,6 +13,7 @@ from opencode_sync.jsonc_edit import (
     detect_unit,
     find_comment_spans,
     find_object_members,
+    find_root_span,
     find_value_span,
     mask_comments,
     mask_trailing_commas,
@@ -177,6 +178,59 @@ class TestObjectMembers:
         assert body.members == []
 
 
+class TestBodyTrailing:
+    """Comments between the last member and the closing brace: the orphan zone."""
+
+    def test_comment_above_closing_brace_is_body_trailing(self):
+        text = '{\n  "a": 1\n  // about the object itself\n}'
+        masked = mask_comments(text)
+        body = find_object_members(masked, Span(0, len(text)))
+        assert body.body_trailing.of(text) == "\n  // about the object itself\n"
+
+    def test_block_comment_above_closing_brace_is_body_trailing(self):
+        text = '{\n  "a": 1\n  /* multiline\n     note */\n}'
+        masked = mask_comments(text)
+        body = find_object_members(masked, Span(0, len(text)))
+        assert "multiline" in body.body_trailing.of(text)
+
+    def test_pure_whitespace_zone_is_body_trailing_too(self):
+        text = '{\n  "a": 1\n\n}'
+        masked = mask_comments(text)
+        body = find_object_members(masked, Span(0, len(text)))
+        assert body.body_trailing.of(text) == "\n\n"
+
+    def test_no_gap_means_empty_body_trailing(self):
+        # Same-line brace: no newline between member and '}'.
+        text = '{"a": 1}'
+        masked = mask_comments(text)
+        body = find_object_members(masked, Span(0, len(text)))
+        assert body.body_trailing.is_empty()
+
+    def test_body_trailing_excludes_closing_brace_indentation(self):
+        # The brace's indentation is re-emitted by render_object, so the span
+        # must end at the brace's line start, not at the brace itself.
+        text = '{\n  "a": 1\n  // note\n  }'
+        masked = mask_comments(text)
+        body = find_object_members(masked, Span(0, len(text)))
+        assert body.body_trailing.of(text) == "\n  // note\n"
+
+    def test_nested_object_gets_its_own_body_trailing(self):
+        text = (
+            '{\n'
+            '  "outer": {\n'
+            '    "a": 1\n'
+            '    // about outer\n'
+            '  },\n'
+            '  "b": 2\n'
+            '}\n'
+        )
+        masked = mask_comments(text)
+        outer = find_object_members(masked, find_root_span(masked))
+        inner = find_object_members(masked, outer.members[0].value_span)
+        assert inner.body_trailing.of(text) == "\n    // about outer\n"
+        assert outer.body_trailing.of(text) == "\n"
+
+
 class TestIndent:
     def test_detects_base_and_unit(self):
         text = '{\n  "models": {\n    "a": 1\n  }\n}'
@@ -214,6 +268,30 @@ class TestRenderObject:
 
     def test_empty(self):
         assert render_object("", "  ", "\n", []) == "{}"
+
+    def test_body_trailing_comments_are_re_emitted(self):
+        out = render_object(
+            "  ",
+            "  ",
+            "\n",
+            [RenderEntry("", '"a"', "1", "")],
+            "\n  // keep me\n",
+        )
+        assert out == '{\n    "a": 1\n  // keep me\n  }'
+
+    def test_pure_whitespace_body_trailing_is_dropped(self):
+        # The entry loop already emits the separating newline; re-emitting an
+        # all-whitespace block would open a blank line ahead of the brace.
+        out = render_object(
+            "  ", "  ", "\n", [RenderEntry("", '"a"', "1", "")], "\n\n"
+        )
+        assert out == '{\n    "a": 1\n  }'
+
+    def test_body_trailing_without_leading_newline_is_separated(self):
+        out = render_object(
+            "", "  ", "\n", [RenderEntry("", '"a"', "1", "")], "// note\n"
+        )
+        assert out == '{\n  "a": 1\n// note\n}'
 
 
 class TestApplyEdits:
